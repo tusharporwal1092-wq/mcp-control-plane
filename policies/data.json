@@ -1,0 +1,17 @@
+{
+  "roles": {
+    "sre1": {
+      "allowed_tools": [
+        "get_pod_logs",
+        "list_pods",
+        "get_deployment_status",
+        "restart_deployment",
+        "scale_deployment",
+        "read_prometheus_metrics"
+      ],
+      "allowed_environments": ["dev", "staging", "prod"],
+      "allowed_namespaces": ["*"]
+    }
+  },
+  "destructive_tools": ["restart_deployment", "scale_deployment", "trigger_jenkins_job"]
+}

@@ -1,0 +1,73 @@
+MCP Control Plane - Run & Test Commands
+========================================
+
+1. Install dependencies
+------------------------
+uv sync
+
+2. Run the application
+------------------------
+Option A - directly:
+uv run python -m app.main
+
+Option B - with uvicorn (auto reload for local dev):
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+
+App will be available at http://127.0.0.1:8000
+
+3. Test endpoints
+------------------------
+All /mcp* routes now require an API key (see section 5). Use the header:
+-H "x-api-key: test_key"
+This resolves to agent01 (role sre1), allowed_tools: get_pod_logs, list_pods, get_deployment_status.
+
+3.1 tools/list - list tools available to the authenticated agent
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/list\",\"params\":{}}"
+
+3.2 tools/call - successful tool call
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"42\",\"method\":\"tools/call\",\"params\":{\"name\":\"get_pod_logs\",\"arguments\":{\"namespace\":\"payments\",\"pod_name\":\"checkout-api-xyz\"}}}"
+
+3.3 tools/call - unknown tool name (expect -32602 Invalid params)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}"
+
+3.4 tools/call - tool not in agent's allowed_tools (expect -32001 Forbidden, HTTP 403)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"restart_deployment\",\"arguments\":{}}}"
+
+3.5 unknown method (expect -32601 Method not found)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"bogus\"}"
+
+3.6 missing method (expect -32600 Invalid Request)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"params\":{}}"
+
+3.7 malformed JSON body (expect -32700 Parse error)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "not json"
+
+3.8 SSE stream - listens for heartbeat events every 5s (Ctrl+C to stop)
+curl -s -N http://127.0.0.1:8000/mcp/sse -H "x-api-key: test_key"
+
+3.9 SSE stream - sample for 3 seconds only (Windows/Git Bash)
+timeout 3 curl -s -N http://127.0.0.1:8000/mcp/sse -H "x-api-key: test_key"
+
+4. Health check endpoints (no API key required)
+------------------------
+curl -s http://127.0.0.1:8000/health/live
+curl -s http://127.0.0.1:8000/health/ready
+
+5. Authentication
+------------------------
+5.1 missing API key (expect HTTP 401)
+curl -s -i -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/list\",\"params\":{}}"
+
+5.2 invalid API key (expect HTTP 401)
+curl -s -i -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: wrong_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/list\",\"params\":{}}"
+
+Notes
+------------------------
+- All tool executors in app/tools/tools_spec.py are stubs (Phase 3 will replace them with real
+  API calls per docs/roadmap.md); they currently just return {"status": "success"}.
+- Auth is now enforced via the `x-api-key` header on every route except /health/live and
+  /health/ready (see API_KEYS registry and authenticate() middleware in app/middleware/auth.py). Each agent
+  has a role and an allowed_tools list; tools/list is filtered to that list, and tools/call
+  returns -32001 Forbidden (HTTP 403) for tools outside it.
+- When running via Docker (docker compose up), browse to http://localhost:8000 rather than
+  http://0.0.0.0:8000 — 0.0.0.0 is a bind address, not a routable host address in a browser.
