@@ -31,10 +31,20 @@ class Agent_data(BaseModel):
 
 # Registry mapping API keys to the agent identity they resolve to.
 API_KEYS: dict[str, Agent_data] = {
+    # Keep in sync with the "sre1" role's allowed_tools in policies/data.json:
+    # this list is the gateway's own pre-OPA scope check, OPA is the second
+    # (environment/namespace-aware) layer for whatever passes this one.
     "test_key": Agent_data(
         id="agent01",
         role="sre1",
-        allowed_tools=["get_pod_logs", "list_pods", "get_deployment_status"],
+        allowed_tools=[
+            "get_pod_logs",
+            "list_pods",
+            "get_deployment_status",
+            "restart_deployment",
+            "scale_deployment",
+            "read_prometheus_metrics",
+        ],
     ),
 }
 

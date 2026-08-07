@@ -21,10 +21,18 @@ namespace_allowed if "*" in role_config.allowed_namespaces
 
 namespace_allowed if input.resource.namespace in role_config.allowed_namespaces
 
+# Hard override: restart_deployment is never allowed against kube-system, no
+# matter the role or environment (docs/tool-spec.md).
+kube_system_restart_blocked if {
+	input.tool.name == "restart_deployment"
+	input.resource.namespace == "kube-system"
+}
+
 allow if {
 	tool_allowed
 	environment_allowed
 	namespace_allowed
+	not kube_system_restart_blocked
 }
 
 require_approval if {

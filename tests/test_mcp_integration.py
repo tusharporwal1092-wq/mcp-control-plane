@@ -28,15 +28,17 @@ def test_tool_call_with_invalid_api_key_returns_401(client):
 
 
 def test_tool_call_with_valid_key_but_disallowed_tool_returns_403(client):
+    # "test_key" isn't scoped to trigger_jenkins_job - see API_KEYS in app/middleware/auth.py.
     response = client.post(
         "/mcp",
-        json=rpc("tools/call", {"name": "restart_deployment"}),
+        json=rpc("tools/call", {"name": "trigger_jenkins_job"}),
         headers={"x-api-key": "test_key"},
     )
     assert response.status_code == 403
     body = response.json()
     assert body["error"]["code"] == -32003
     assert "not allowed to call" in body["error"]["data"]["error"]
+    assert body["error"]["data"]["policy_decision"] == "forbidden"
 
 
 def test_tool_call_requiring_approval_returns_403_without_executing(client, monkeypatch):

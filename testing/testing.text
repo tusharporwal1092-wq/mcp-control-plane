@@ -19,7 +19,9 @@ App will be available at http://127.0.0.1:8000
 ------------------------
 All /mcp* routes now require an API key (see section 5). Use the header:
 -H "x-api-key: test_key"
-This resolves to agent01 (role sre1), allowed_tools: get_pod_logs, list_pods, get_deployment_status.
+This resolves to agent01 (role sre1), allowed_tools: get_pod_logs, list_pods,
+get_deployment_status, restart_deployment, scale_deployment, read_prometheus_metrics
+(see API_KEYS in app/middleware/auth.py).
 
 3.1 tools/list - list tools available to the authenticated agent
 curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"method\":\"tools/list\",\"params\":{}}"
@@ -30,22 +32,25 @@ curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H
 3.3 tools/call - unknown tool name (expect -32602 Invalid params)
 curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"3\",\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"}}"
 
-3.4 tools/call - tool not in agent's allowed_tools (expect -32001 Forbidden, HTTP 403)
-curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"restart_deployment\",\"arguments\":{}}}"
+3.4 tools/call - tool not in agent's allowed_tools (expect -32003 Forbidden, HTTP 403)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"6\",\"method\":\"tools/call\",\"params\":{\"name\":\"trigger_jenkins_job\",\"arguments\":{}}}"
 
-3.5 unknown method (expect -32601 Method not found)
+3.5 tools/call - restart_deployment in prod (expect -32010 Approval required, HTTP 403; requires the opa service, see docker-compose.yaml)
+curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"method\":\"tools/call\",\"params\":{\"name\":\"restart_deployment\",\"arguments\":{\"namespace\":\"prod-payments\"}}}"
+
+3.6 unknown method (expect -32601 Method not found)
 curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"4\",\"method\":\"bogus\"}"
 
-3.6 missing method (expect -32600 Invalid Request)
+3.7 missing method (expect -32600 Invalid Request)
 curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "{\"jsonrpc\":\"2.0\",\"id\":\"5\",\"params\":{}}"
 
-3.7 malformed JSON body (expect -32700 Parse error)
+3.8 malformed JSON body (expect -32700 Parse error)
 curl -s -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" -d "not json"
 
-3.8 SSE stream - listens for heartbeat events every 5s (Ctrl+C to stop)
+3.9 SSE stream - listens for heartbeat events every 5s (Ctrl+C to stop)
 curl -s -N http://127.0.0.1:8000/mcp/sse -H "x-api-key: test_key"
 
-3.9 SSE stream - sample for 3 seconds only (Windows/Git Bash)
+3.10 SSE stream - sample for 3 seconds only (Windows/Git Bash)
 timeout 3 curl -s -N http://127.0.0.1:8000/mcp/sse -H "x-api-key: test_key"
 
 4. Health check endpoints (no API key required)
@@ -68,6 +73,9 @@ Notes
 - Auth is now enforced via the `x-api-key` header on every route except /health/live and
   /health/ready (see API_KEYS registry and authenticate() middleware in app/middleware/auth.py). Each agent
   has a role and an allowed_tools list; tools/list is filtered to that list, and tools/call
-  returns -32001 Forbidden (HTTP 403) for tools outside it.
+  returns -32003 Forbidden (HTTP 403) for tools outside it.
+- Tool calls that pass the allowed_tools check are then evaluated by OPA (policies/authz.rego,
+  see app/authz/opa.py) - denied calls return -32603 (HTTP 403), calls needing human approval
+  return -32010 (HTTP 403). See docs/rego-policies.md for how the policy is structured.
 - When running via Docker (docker compose up), browse to http://localhost:8000 rather than
   http://0.0.0.0:8000 — 0.0.0.0 is a bind address, not a routable host address in a browser.

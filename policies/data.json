@@ -11,6 +11,30 @@
       ],
       "allowed_environments": ["dev", "staging", "prod"],
       "allowed_namespaces": ["*"]
+    },
+    "readonly": {
+      "allowed_tools": [
+        "get_pod_logs",
+        "list_pods",
+        "get_deployment_status",
+        "query_terraform_plan",
+        "get_jenkins_job_status",
+        "read_prometheus_metrics",
+        "read_ticket"
+      ],
+      "allowed_environments": ["dev", "staging", "prod"],
+      "allowed_namespaces": ["*"]
+    },
+    "deploy-bot": {
+      "allowed_tools": [
+        "restart_deployment",
+        "scale_deployment",
+        "trigger_jenkins_job",
+        "get_jenkins_job_status",
+        "query_terraform_plan"
+      ],
+      "allowed_environments": ["dev", "staging"],
+      "allowed_namespaces": ["*"]
     }
   },
   "destructive_tools": ["restart_deployment", "scale_deployment", "trigger_jenkins_job"]

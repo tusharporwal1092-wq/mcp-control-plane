@@ -105,7 +105,17 @@ uv run pytest
 ```
 
 Covers the auth middleware, rate limiter, OPA integration, and end-to-end `/mcp`
-request handling (see `tests/`).
+request handling (see `tests/`). A subset (`tests/test_opa_docker_integration.py`)
+spins up the real `openpolicyagent/opa` image against `policies/` and is skipped
+automatically if Docker isn't available.
+
+Rego policy tests run separately, via `opa test`:
+
+```bash
+docker run --rm -v "$(pwd)/policies:/policies" openpolicyagent/opa:latest test /policies -v
+```
+
+Both suites run in CI on every PR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## Documentation
 
@@ -116,3 +126,4 @@ request handling (see `tests/`).
 | [`docs/api-design.md`](docs/api-design.md) | MCP + admin API surface |
 | [`docs/tool-spec.md`](docs/tool-spec.md) | Per-tool input/output schemas and policy constraints |
 | [`docs/threat-model.md`](docs/threat-model.md) | STRIDE threat model and mitigations |
+| [`docs/rego-policies.md`](docs/rego-policies.md) | Rego policy structure, for policy authors |

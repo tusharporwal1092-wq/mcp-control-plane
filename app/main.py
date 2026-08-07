@@ -165,7 +165,11 @@ async def mcp(request: Request):
                     rpc_id,
                     -32003,
                     "Forbidden",
-                    {"field": "name", "error": f"agent '{agent.id}' is not allowed to call '{tool_name}'"},
+                    {
+                        "field": "name",
+                        "error": f"agent '{agent.id}' is not allowed to call '{tool_name}'",
+                        "policy_decision": "forbidden",
+                    },
                 ),
                 status_code=403,
             )
@@ -228,7 +232,12 @@ async def mcp(request: Request):
                 )
             )
             return JSONResponse(
-                _rpc_error(rpc_id, -32603, "Executor error", {"reason": str(exc)}),
+                _rpc_error(
+                    rpc_id,
+                    -32603,
+                    "Executor error",
+                    {"reason": str(exc), "policy_decision": "allow"},
+                ),
                 status_code=500,
             )
 

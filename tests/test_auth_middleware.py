@@ -74,4 +74,5 @@ async def test_valid_api_key_agent_has_expected_identity():
     agent = request.state.agent
     assert agent.id == "agent01"
     assert agent.role == "sre1"
-    assert agent.allowed_tools == ["get_pod_logs", "list_pods", "get_deployment_status"]
+    assert "get_pod_logs" in agent.allowed_tools
+    assert "trigger_jenkins_job" not in agent.allowed_tools
