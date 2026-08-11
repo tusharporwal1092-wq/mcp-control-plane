@@ -18,10 +18,13 @@ implemented:
 - API key authentication, resolving each key to an agent identity (`id`, `role`, `allowed_tools`)
 - Redis-backed sliding-window rate limiting, per agent
 - Tool call interception, normalization, and an OPA policy check (allow / deny / require_approval)
-- 11 tool executors — currently stubs, real downstream API calls land per `docs/roadmap.md` Phase 3
+- 7 read-only tool executors calling real downstream APIs (Kubernetes, Terraform Cloud, Jenkins,
+  Prometheus, PagerDuty/Jira) — `docs/roadmap.md` Phase 3. The 3 write tools
+  (`restart_deployment`, `scale_deployment`, `trigger_jenkins_job`) are still stubs, pending
+  Phase 4's approval gate.
 - Structured audit logging to stdout (durable, hash-chained Postgres storage is a later phase)
 
-Not yet built: real tool executors, the human-in-the-loop approval workflow, persistent
+Not yet built: the 3 write tool executors, the human-in-the-loop approval workflow, persistent
 audit storage, and observability (OTel/Grafana) — see the roadmap for sequencing.
 
 ## Architecture
@@ -35,7 +38,9 @@ Agent → POST /mcp → [log] → [authn] → [rate limit] → interceptor → O
 - `app/middleware/rate_limit.py` — Redis sliding-window limiter
 - `app/interceptor.py` — validates/normalizes `tools/call` params into an OPA input document
 - `app/authz/opa.py` — calls the OPA sidecar, maps its response to allow/deny/require_approval
-- `app/tools/tools_spec.py` — tool executors (stubs today)
+- `app/tools/tools_spec.py` — tool executors (7 read-only tools call real APIs; 3 write tools are still stubs)
+- `app/tools/k8s_client.py` — cached K8s API clients + ApiException/timeout -> `ExecutorError` mapping
+- `app/tools/errors.py`, `app/tools/config.py` — shared `ExecutorError` type and the 10s/30s executor timeout
 - `app/audit.py` — audit trail of every tool call
 - `policies/` — Rego policy (`authz.rego`) and role/tool data (`data.json`) loaded by OPA
 
@@ -77,6 +82,27 @@ uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 The app reads `REDIS_URL` (default `redis://localhost:6379`) and `OPA_URL` (default
 `http://localhost:8181/v1/data/authz`) from the environment; Compose sets both to point
 at the sibling containers.
+
+### Tool executor configuration
+
+Each read-only executor talks to a real downstream API and reads its own credentials/URL
+from the environment (all optional locally — a tool without its config set returns an
+`upstream_error` rather than crashing):
+
+| Tool(s) | Env vars |
+|---------|----------|
+| `get_pod_logs`, `list_pods`, `get_deployment_status` | none — uses in-cluster config, or `KUBECONFIG` / `~/.kube/config` locally |
+| `query_terraform_plan` | `TFC_TOKEN`, `TFC_ORG`, `TFC_URL` (default `https://app.terraform.io/api/v2`) |
+| `get_jenkins_job_status` | `JENKINS_URL`, `JENKINS_USER`, `JENKINS_API_TOKEN` |
+| `read_prometheus_metrics` | `PROMETHEUS_URL` (default `http://localhost:9090`) |
+| `read_ticket` (pagerduty) | `PAGERDUTY_API_TOKEN`, `PAGERDUTY_URL` (default `https://api.pagerduty.com`) |
+| `read_ticket` (jira) | `JIRA_URL`, `JIRA_USER`, `JIRA_API_TOKEN` |
+| all of the above | `EXECUTOR_TIMEOUT_SECONDS` (default `10`, clamped to a `30` max) |
+
+**Local Kubernetes tools:** point `KUBECONFIG` at a local cluster (e.g. `kind create cluster`
+or `minikube start`, then `kubectl config use-context kind-kind` / `minikube`) before calling
+`get_pod_logs`, `list_pods`, or `get_deployment_status` — the gateway uses whatever context is
+currently active, same as `kubectl`.
 
 ### Try it
 

@@ -95,20 +95,22 @@ Implement the 7 read-only tool executors, each calling a real downstream API. Fo
 ### Deliverables
 
 **Week 5: K8s + Terraform tools**
-- [ ] K8s executor: `get_pod_logs` — kubernetes Python client, namespace-scoped
-- [ ] K8s executor: `list_pods` — with label/field selector support
-- [ ] K8s executor: `get_deployment_status` — parse deployment conditions into structured output
-- [ ] Terraform executor: `query_terraform_plan` — call Terraform Cloud API, parse plan summary
-- [ ] Implement executor timeout handling (10s default, 30s max)
-- [ ] Implement executor error mapping to MCP error types
-- [ ] Local dev: configure `kubectl` context pointing to a local Kind/Minikube cluster
+- [x] K8s executor: `get_pod_logs` — kubernetes Python client, namespace-scoped
+- [x] K8s executor: `list_pods` — with label/field selector support
+- [x] K8s executor: `get_deployment_status` — parse deployment conditions into structured output
+- [x] Terraform executor: `query_terraform_plan` — call Terraform Cloud API, parse plan summary
+- [x] Implement executor timeout handling (10s default, 30s max)
+- [x] Implement executor error mapping to MCP error types
+- [ ] Local dev: configure `kubectl` context pointing to a local Kind/Minikube cluster — see
+      README "Local Kubernetes tools" (manual local setup step, not something the codebase does)
 
 **Week 6: Jenkins + Prometheus + Ticketing read tools**
-- [ ] Jenkins executor: `get_jenkins_job_status` — call Jenkins REST API
-- [ ] Prometheus executor: `read_prometheus_metrics` — call Prometheus HTTP API, validate PromQL
-- [ ] Ticketing executor: `read_ticket` — PagerDuty REST API or Jira REST API
-- [ ] Write integration tests for each executor against real (or locally mocked) downstream APIs
-- [ ] Add per-executor timeout metrics to the OTel span
+- [x] Jenkins executor: `get_jenkins_job_status` — call Jenkins REST API
+- [x] Prometheus executor: `read_prometheus_metrics` — call Prometheus HTTP API, validate PromQL
+- [x] Ticketing executor: `read_ticket` — PagerDuty REST API or Jira REST API
+- [x] Write integration tests for each executor against real (or locally mocked) downstream APIs
+- [ ] Add per-executor timeout metrics to the OTel span — deferred to Phase 6 (Observability),
+      no OTel SDK wired up yet
 
 **Exit Criteria:**
 - All 7 read tools return real data from real (or local) downstream APIs.
@@ -124,10 +126,12 @@ Implement the 3 write tools and the human-in-the-loop approval gate.
 
 ### Deliverables
 
-- [ ] K8s executor: `restart_deployment` — patch `restartedAt` annotation
-- [ ] K8s executor: `scale_deployment` — patch deployment scale subresource
-- [ ] Jenkins executor: `trigger_jenkins_job` — `buildWithParameters` with parameter allowlist
-- [ ] Implement approval gate:
+- [x] K8s executor: `restart_deployment` — patch `restartedAt` annotation
+- [x] K8s executor: `scale_deployment` — patch deployment scale subresource
+- [x] Jenkins executor: `trigger_jenkins_job` — `buildWithParameters` with parameter allowlist
+      (allowlist enforcement itself is OPA's job per docs/tool-spec.md, not the executor's)
+- [ ] Implement approval gate — **not built yet**; a prod call that OPA flags `require_approval`
+      still just gets a 403 "approval required" and stops there, same as before this pass:
   - [ ] Persist pending approval to Redis with TTL (15 min)
   - [ ] Send Slack message via Incoming Webhook (action details + approve/deny buttons)
   - [ ] `POST /admin/approvals/{id}/decide` endpoint (Slack interactive callback target)
@@ -136,6 +140,7 @@ Implement the 3 write tools and the human-in-the-loop approval gate.
   - [ ] On denial: write `approval_denied` audit entry; return error to agent
   - [ ] SSE: push approval result to the agent's open SSE connection
 - [ ] Integration test: `restart_deployment` in prod → approval pending → approve → executor called → audit logged
+      (blocked on the approval gate above)
 
 **Exit Criteria:**
 - A prod restart call goes through the full approval flow end-to-end.

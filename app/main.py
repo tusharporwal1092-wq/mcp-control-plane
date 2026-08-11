@@ -36,6 +36,20 @@ from .middleware.logging import log_requests
 from .middleware.rate_limit import RATE_LIMIT_WINDOW_SECONDS, SlidingWindowRateLimiter, rate_limit
 from .redis_client import create_redis_client
 from .tools import tools_spec as tools
+from .tools.errors import ExecutorError
+
+# error_type -> HTTP status, per docs/tool-spec.md's Error Response Format.
+# executor_timeout gets its own 504 (the doc calls this out explicitly);
+# everything else the executor raises deliberately is a 4xx client-shaped
+# error, and anything unexpected (an unhandled exception, not ExecutorError)
+# falls back to 500 "upstream_error" below since we don't know its shape.
+_ERROR_TYPE_STATUS = {
+    "validation_error": 400,
+    "not_found": 404,
+    "permission_denied": 403,
+    "executor_timeout": 504,
+    "upstream_error": 502,
+}
 
 # INFO is the level app/middleware/logging.py and app/audit.py log at; without
 # this, Python's default root level (WARNING) would silently swallow them.
@@ -219,8 +233,44 @@ async def mcp(request: Request):
 
         try:
             result = TOOLS[tool_name](arguments)
+        except ExecutorError as exc:
+            # Deliberate failure the executor already classified (bad args,
+            # not found, timeout, ...) - map its error_type to the status
+            # code docs/tool-spec.md specifies, and surface error_type in
+            # the response so the calling agent can distinguish "retry me"
+            # (executor_timeout) from "don't retry, fix the args" (validation_error).
+            status_code = _ERROR_TYPE_STATUS[exc.error_type]
+            # executor_timeout gets its own audit decision (per doc: "audit
+            # log entry is written with result_status: executor_timeout")
+            # so it's distinguishable from an ordinary executor error.
+            decision = "executor_timeout" if exc.error_type == "executor_timeout" else "error"
+            logger.warning("Executor error for tool %s: %s (%s)", tool_name, exc, exc.error_type)
+            record_tool_call(
+                AuditEvent(
+                    agent_id=context.agent_id,
+                    role=context.role,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    decision=decision,
+                    reason=str(exc),
+                )
+            )
+            return JSONResponse(
+                _rpc_error(
+                    rpc_id,
+                    -32603,
+                    f"Executor error: {exc}",
+                    {"reason": str(exc), "error_type": exc.error_type, "policy_decision": "allow"},
+                ),
+                status_code=status_code,
+            )
         except Exception as exc:
-            logger.exception("Executor error for tool %s", tool_name)
+            # Anything an executor didn't deliberately raise as ExecutorError
+            # (a bug, an unmapped client exception) - logged with a full
+            # traceback since, unlike the branch above, we don't know what
+            # went wrong. error_type still gets set so the response shape
+            # is uniform for callers.
+            logger.exception("Unhandled executor error for tool %s", tool_name)
             record_tool_call(
                 AuditEvent(
                     agent_id=context.agent_id,
@@ -236,7 +286,7 @@ async def mcp(request: Request):
                     rpc_id,
                     -32603,
                     "Executor error",
-                    {"reason": str(exc), "policy_decision": "allow"},
+                    {"reason": str(exc), "error_type": "upstream_error", "policy_decision": "allow"},
                 ),
                 status_code=500,
             )

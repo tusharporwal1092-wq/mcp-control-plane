@@ -61,10 +61,20 @@ def test_tool_call_requiring_approval_returns_403_without_executing(client, monk
     assert body["error"]["data"]["policy_decision"] == "require_approval"
 
 
-def test_tool_call_with_valid_key_and_allowed_tool_succeeds(client):
+def test_tool_call_with_valid_key_and_allowed_tool_succeeds(client, monkeypatch):
+    # Every registered tool now calls a real downstream API (Phase 3 read
+    # tools, Phase 4 write tools) or validates real arguments, so this test
+    # stubs the dispatch table entry directly instead of relying on a tool
+    # that happens to still be a placeholder - it only needs to cover the
+    # golden path's plumbing: authn -> rate limit -> interceptor -> OPA ->
+    # executor -> audit -> 200 response, not any tool's business logic.
+    from app import main as app_main
+
+    monkeypatch.setitem(app_main.TOOLS, "restart_deployment", lambda arguments: {"status": "success"})
+
     response = client.post(
         "/mcp",
-        json=rpc("tools/call", {"name": "list_pods", "arguments": {}}),
+        json=rpc("tools/call", {"name": "restart_deployment", "arguments": {}}),
         headers={"x-api-key": "test_key"},
     )
     assert response.status_code == 200
