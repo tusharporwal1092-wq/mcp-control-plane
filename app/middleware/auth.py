@@ -19,6 +19,15 @@ DEFAULT_RATE_LIMIT_RPM = 60
 # Paths that don't require an API key (liveness/readiness probes).
 PUBLIC_PATHS = {"/health/live", "/health/ready"}
 
+# /admin/approvals/{id}/... has its own auth: the decide endpoint verifies
+# Slack's X-Slack-Signature HMAC (app/slack.py), not an agent API key.
+# /admin/audit... has no auth of its own yet. Either way, a real deploy would
+# put the admin JWT from docs/api-design.md S2.2 in front of these - that JWT
+# layer isn't built anywhere in this codebase yet, so it's skipped here too
+# rather than half-built (an agent's tool-scoped API key is the wrong
+# credential for admin endpoints regardless).
+PUBLIC_PATH_PREFIXES = ("/admin/approvals/", "/admin/audit")
+
 
 class Agent_data(BaseModel):
     """Resolved caller identity: who is calling, what they may do, how fast."""
@@ -58,7 +67,7 @@ async def authenticate(request: Request, call_next):
 
     Registered in app/main.py via `app.add_middleware(..., dispatch=authenticate)`.
     """
-    if request.url.path in PUBLIC_PATHS:
+    if request.url.path in PUBLIC_PATHS or request.url.path.startswith(PUBLIC_PATH_PREFIXES):
         return await call_next(request)
 
     api_key = request.headers.get("x-api-key")

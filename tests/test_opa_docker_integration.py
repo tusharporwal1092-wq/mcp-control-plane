@@ -81,18 +81,53 @@ def opa_url():
         subprocess.run(["docker", "stop", container_id], capture_output=True)
 
 
+class _NoopDbPool:
+    """This test is about OPA, not the audit log - stand in for asyncpg.Pool
+    so app startup doesn't need a real Postgres too (mirrors
+    tests/conftest.py's `client` fixture)."""
+
+    async def close(self):
+        pass
+
+
 @pytest.fixture
 def real_opa_client(monkeypatch, opa_url):
     monkeypatch.setattr(app_main, "create_redis_client", lambda: FakeRedis())
+    # app/main.py's startup() now awaits create_db_pool() unconditionally -
+    # without these two stubs this fixture would try to open a real Postgres
+    # connection (and, on an allowed call, a real audit write) that nothing
+    # in this file spins up.
+    monkeypatch.setattr(app_main, "create_db_pool", lambda: _create_noop_db_pool())
+    monkeypatch.setattr(app_main, "record_tool_call", _noop_record_tool_call)
     monkeypatch.setattr(opa_module, "OPA_URL", opa_url)
     with TestClient(app_main.app) as test_client:
         yield test_client
 
 
-def test_sre_get_pod_logs_allowed_in_prod(real_opa_client):
+async def _create_noop_db_pool():
+    return _NoopDbPool()
+
+
+async def _noop_record_tool_call(pool, event):
+    pass
+
+
+def test_sre_get_pod_logs_allowed_in_prod(real_opa_client, monkeypatch):
+    # get_pod_logs is a real K8s-calling executor (app/tools/tools_spec.py) -
+    # this test is about the real OPA policy decision (allow, sre role,
+    # get_pod_logs, prod), not about actually reaching a cluster, so the
+    # executor itself is stubbed the same way test_mcp_integration.py's
+    # golden-path test stubs TOOLS. `pod_name` is required by the real
+    # interceptor/executor validation even though only `namespace` matters
+    # to the Rego policy being exercised here.
+    monkeypatch.setitem(app_main.TOOLS, "get_pod_logs", lambda arguments: {"status": "success"})
+
     response = real_opa_client.post(
         "/mcp",
-        json=rpc("tools/call", {"name": "get_pod_logs", "arguments": {"namespace": "prod-payments"}}),
+        json=rpc(
+            "tools/call",
+            {"name": "get_pod_logs", "arguments": {"namespace": "prod-payments", "pod_name": "checkout-api-xyz"}},
+        ),
         headers={"x-api-key": "test_key"},
     )
     assert response.status_code == 200
@@ -100,12 +135,15 @@ def test_sre_get_pod_logs_allowed_in_prod(real_opa_client):
 
 
 def test_sre_restart_deployment_in_prod_requires_approval(real_opa_client):
+    # Per docs/roadmap.md Phase 4 / docs/api-design.md S3.3: require_approval
+    # is a 202-pending result, not a JSON-RPC error - it used to return 403
+    # with -32010 before the approval gate was built.
     response = real_opa_client.post(
         "/mcp",
         json=rpc("tools/call", {"name": "restart_deployment", "arguments": {"namespace": "prod-payments"}}),
         headers={"x-api-key": "test_key"},
     )
-    assert response.status_code == 403
+    assert response.status_code == 202
     body = response.json()
-    assert body["error"]["code"] == -32010
-    assert body["error"]["data"]["policy_decision"] == "require_approval"
+    assert body["result"]["_meta"]["approval_status"] == "pending"
+    assert body["result"]["_meta"]["approval_id"]

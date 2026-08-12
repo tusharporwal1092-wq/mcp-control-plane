@@ -41,24 +41,29 @@ def test_tool_call_with_valid_key_but_disallowed_tool_returns_403(client):
     assert body["error"]["data"]["policy_decision"] == "forbidden"
 
 
-def test_tool_call_requiring_approval_returns_403_without_executing(client, monkeypatch):
+def test_tool_call_requiring_approval_returns_202_pending_without_executing(client, monkeypatch):
     from app import main as app_main
     from app.authz.opa import PolicyDecision
 
     async def _require_approval(context):
         return PolicyDecision(allow=True, require_approval=True, reason="destructive action in prod")
 
+    async def _no_slack(approval):
+        return None
+
     monkeypatch.setattr(app_main, "evaluate_policy", _require_approval)
+    monkeypatch.setattr(app_main.slack, "send_approval_request", _no_slack)
+    monkeypatch.setitem(app_main.TOOLS, "list_pods", lambda arguments: (_ for _ in ()).throw(AssertionError("must not execute")))
 
     response = client.post(
         "/mcp",
         json=rpc("tools/call", {"name": "list_pods", "arguments": {}}),
         headers={"x-api-key": "test_key"},
     )
-    assert response.status_code == 403
+    assert response.status_code == 202
     body = response.json()
-    assert body["error"]["code"] == -32010
-    assert body["error"]["data"]["policy_decision"] == "require_approval"
+    assert body["result"]["_meta"]["approval_status"] == "pending"
+    assert body["result"]["_meta"]["approval_id"]
 
 
 def test_tool_call_with_valid_key_and_allowed_tool_succeeds(client, monkeypatch):

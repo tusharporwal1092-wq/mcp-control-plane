@@ -11,6 +11,14 @@ dependencies = [
     "redis>=5.0.0",
     "kubernetes>=36.0.3",
     "httpx>=0.28.1",
+    "asyncpg>=0.31.0",
+    "alembic>=1.19.1",
+    "sqlalchemy>=2.0.51",
+]
+
+[project.optional-dependencies]
+export = [
+    "boto3>=1.43.68",
 ]
 
 [dependency-groups]

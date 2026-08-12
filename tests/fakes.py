@@ -1,15 +1,38 @@
 """Fakes shared across tests.
 
 FakeRedis implements just the subset of the redis.asyncio.Redis surface that
-app/middleware/rate_limit.py relies on (sorted-set ops + pipeline), backed by
-an in-memory dict instead of a real Redis server.
+app/middleware/rate_limit.py (sorted-set ops + pipeline) and app/approvals.py
+(get/set with ex/keepttl) rely on, backed by an in-memory dict instead of a
+real Redis server.
 """
+import time
+
 import redis.asyncio as redis
 
 
 class FakeRedis:
     def __init__(self):
         self._zsets: dict[str, dict[str, float]] = {}
+        self._kv: dict[str, tuple[str, float | None]] = {}  # key -> (value, expire_at)
+
+    async def set(self, key, value, ex=None, keepttl=False):
+        if keepttl and key in self._kv:
+            expire_at = self._kv[key][1]
+        elif ex is not None:
+            expire_at = time.time() + ex
+        else:
+            expire_at = None
+        self._kv[key] = (value, expire_at)
+
+    async def get(self, key):
+        entry = self._kv.get(key)
+        if entry is None:
+            return None
+        value, expire_at = entry
+        if expire_at is not None and time.time() > expire_at:
+            del self._kv[key]
+            return None
+        return value
 
     async def zremrangebyscore(self, key, min_score, max_score):
         zset = self._zsets.get(key, {})

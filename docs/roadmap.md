@@ -130,22 +130,32 @@ Implement the 3 write tools and the human-in-the-loop approval gate.
 - [x] K8s executor: `scale_deployment` — patch deployment scale subresource
 - [x] Jenkins executor: `trigger_jenkins_job` — `buildWithParameters` with parameter allowlist
       (allowlist enforcement itself is OPA's job per docs/tool-spec.md, not the executor's)
-- [ ] Implement approval gate — **not built yet**; a prod call that OPA flags `require_approval`
-      still just gets a 403 "approval required" and stops there, same as before this pass:
-  - [ ] Persist pending approval to Redis with TTL (15 min)
-  - [ ] Send Slack message via Incoming Webhook (action details + approve/deny buttons)
-  - [ ] `POST /admin/approvals/{id}/decide` endpoint (Slack interactive callback target)
-  - [ ] Verify `X-Slack-Signature` HMAC on callback
-  - [ ] On approval: resume tool call, call executor, write result to audit log
-  - [ ] On denial: write `approval_denied` audit entry; return error to agent
-  - [ ] SSE: push approval result to the agent's open SSE connection
-- [ ] Integration test: `restart_deployment` in prod → approval pending → approve → executor called → audit logged
-      (blocked on the approval gate above)
+- [x] Implement approval gate — a prod call that OPA flags `require_approval` is now persisted,
+      notified, and resumed end-to-end instead of dead-ending at a 403 (app/approvals.py,
+      app/slack.py, app/sse_hub.py, app/main.py):
+  - [x] Persist pending approval to Redis with TTL (15 min) — `app/approvals.py::create_pending_approval`
+  - [x] Send Slack message via Incoming Webhook (action details + approve/deny buttons) — `app/slack.py::send_approval_request`
+  - [x] `POST /admin/approvals/{id}/decide` endpoint (Slack interactive callback target) — `app/main.py::decide_approval`
+  - [x] Verify `X-Slack-Signature` HMAC on callback — `app/slack.py::verify_signature`
+  - [x] On approval: resume tool call, call executor, write result to audit log
+  - [x] On denial: write `approval_denied` audit entry; return error to agent (also rejects a
+        replayed callback: `verify_signature` checks the timestamp, not just the HMAC)
+  - [x] SSE: push approval result to the agent's open SSE connection — `app/sse_hub.py`, wired into `/mcp/sse`
+- [x] Integration test: `restart_deployment` in prod → approval pending → approve → executor called → audit logged
+      — `tests/test_approvals.py::test_full_approval_flow_restart_deployment_in_prod`
 
 **Exit Criteria:**
-- A prod restart call goes through the full approval flow end-to-end.
-- A forged approval callback (bad HMAC) is rejected with 401.
-- Approval expiry (TTL elapsed) correctly returns an error.
+- [x] A prod restart call goes through the full approval flow end-to-end.
+- [x] A forged approval callback (bad HMAC) is rejected with 401.
+- [x] Approval expiry (TTL elapsed) correctly returns an error.
+
+  Not built (out of scope for this pass, called out explicitly rather than half-built):
+  admin JWT auth in front of `/admin/approvals/*` (docs/api-design.md S2.2 describes it, no JWT
+  layer exists anywhere in this codebase yet — the decide endpoint's HMAC check is its only auth);
+  cross-pod SSE fan-out (`app/sse_hub.py` is in-process only, fine for the current single-process
+  gateway, would need Redis pub/sub for multiple replicas); the PostgreSQL audit log itself (still
+  the Phase 5 stdout stub in `app/audit.py` — approval decisions log through the same stub as
+  every other tool call).
 
 ---
 
@@ -156,20 +166,43 @@ Implement the PostgreSQL-backed append-only audit log with SHA-256 hash chaining
 
 ### Deliverables
 
-- [ ] Database schema: `audit_log` table, `approvals` table (with migrations via Alembic)
-- [ ] Async audit log writer: write entry after every tool call (success, deny, error)
-- [ ] Implement SHA-256 `row_hash` chain: each row hashes `prev_hash + id + agent_id + tool + args + result + timestamp`
-- [ ] Implement `GET /admin/audit` query endpoint with filters and pagination
-- [ ] Implement `integrity_check` computation on query response
-- [ ] Implement `GET /admin/audit/export` streaming NDJSON endpoint
-- [ ] Write hash chain verification test: insert rows, modify one manually, verify `integrity_check` returns `fail`
-- [ ] S3 export: schedule daily export of prior day's rows to S3 (append-only bucket)
-- [ ] Document retention policy: 90 days in PostgreSQL, 7 years in S3 Glacier
+- [x] Database schema: `audit_log` table, `approvals` table (with migrations via Alembic)
+      — `migrations/versions/0001_create_audit_tables.py`, applied with `uv run alembic upgrade head`.
+      `approvals` is schema-only in this pass (see the note in that migration file) - the app still
+      writes approval state to Redis only (app/approvals.py, Phase 4); nothing populates the
+      Postgres `approvals` table yet, and `audit_log.approval_id` has no FK to it (deliberate -
+      see `app/audit.py`'s module docstring).
+- [x] Async audit log writer: write entry after every tool call (success, deny, error)
+      — `app/audit.py::record_tool_call`, called (awaited) from every `record_tool_call(...)` site
+      in `app/main.py` (both `/mcp` and the approval-decide endpoint).
+- [x] Implement SHA-256 `row_hash` chain: each row hashes `prev_hash + id + agent_id + tool + args + result + timestamp`
+      — `app/audit.py::_row_hash`. Writes are serialized with a Postgres advisory lock
+      (`CHAIN_LOCK_KEY`) so two concurrent writers can never chain off the same `prev_hash`.
+- [x] Implement `GET /admin/audit` query endpoint with filters and pagination — `app/main.py::get_audit_log`
+- [x] Implement `integrity_check` computation on query response — `app/audit.py::verify_rows`
+      (recomputes each returned row's hash against its true predecessor by seq, not just the
+      previous row in a filtered page - see that function's docstring for why)
+- [x] Implement `GET /admin/audit/export` streaming NDJSON endpoint — `app/main.py::export_audit_log_endpoint`,
+      backed by `app/audit.py::export_audit_log` (asyncpg server-side cursor, not loaded into memory at once)
+- [x] Write hash chain verification test: insert rows, modify one manually, verify `integrity_check` returns `fail`
+      — `tests/test_audit_docker_integration.py::test_hash_chain_tamper_is_detected` (real Postgres, Docker-gated)
+- [x] S3 export: schedule daily export of prior day's rows to S3 (append-only bucket)
+      — `scripts/export_audit_to_s3.py` + `.github/workflows/audit-export.yml` (daily cron). No-ops
+      until `AUDIT_LOG_S3_BUCKET` etc. are configured as repo secrets - there's no deployed
+      Postgres/S3 for this project yet (Phase 7, Infrastructure as Code, hasn't started), so this
+      can't run for real until that exists; the workflow is honest about that rather than faking success.
+- [x] Document retention policy: 90 days in PostgreSQL, 7 years in S3 Glacier — docs/architecture.md S3.5.
+      Documented only: the Postgres-side 90-day deletion and the S3 lifecycle-to-Glacier rule are both
+      *not automated* anywhere in this repo (would be a `pg_cron`/scheduled `DELETE` and a Terraform S3
+      lifecycle rule respectively - Phase 7 again).
 
 **Exit Criteria:**
-- Every test tool call in the integration suite has a corresponding audit row.
-- Modifying any audit row causes the integrity check to fail.
-- Export endpoint returns well-formed NDJSON with all required fields.
+- [x] Every test tool call in the integration suite has a corresponding audit row.
+      (`test_every_tool_call_gets_an_audit_row`, Docker-gated - the rest of the suite stubs
+      `record_tool_call` to a no-op by default, same as it already stubbed `evaluate_policy`,
+      since audit persistence needs a real database to mean anything.)
+- [x] Modifying any audit row causes the integrity check to fail.
+- [x] Export endpoint returns well-formed NDJSON with all required fields.
 
 ---
 

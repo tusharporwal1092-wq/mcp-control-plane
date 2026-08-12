@@ -4,13 +4,13 @@ Each function is the executor for one MCP tool, registered in the TOOLS dict
 in app/main.py. Phase 3 (docs/roadmap.md) implements the 7 read-only
 executors against real downstream APIs (K8s, Terraform Cloud, Jenkins,
 Prometheus, PagerDuty/Jira). Phase 4 implements the 3 write executors
-(`restart_deployment`, `scale_deployment`, `trigger_jenkins_job`) - the
-human-in-the-loop approval gate that lets a prod call actually resume after
-Slack approval is still unbuilt, so app/main.py's `require_approval` branch
-still just returns "approval required" and never reaches these; they only
-run today when OPA allows the call outright (e.g. staging). `open_ticket`
-remains a stub pending that same approval gate (PagerDuty severity:critical
-requires approval).
+(`restart_deployment`, `scale_deployment`, `trigger_jenkins_job`) plus the
+human-in-the-loop approval gate (app/approvals.py, app/slack.py): a prod call
+that OPA flags `require_approval` is held pending in Redis and only reaches
+these functions if a human approves via the Slack callback
+(`POST /admin/approvals/{id}/decide` in app/main.py); a denial or expiry
+never calls the executor at all. `open_ticket` remains a stub - it's outside
+Phase 4's tool list (only the three above), not blocked on the gate itself.
 
 Every executor:
 - validates the arguments it needs and raises ExecutorError("validation_error", ...)

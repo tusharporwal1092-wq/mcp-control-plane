@@ -167,34 +167,60 @@ Each tool runs in an isolated executor class with its own credentials and least-
 
 ### 3.4 Approval Gate
 
-For destructive actions (e.g., `restart_deployment` in prod, `scale_deployment` to 0), the policy engine returns `require_approval: true`. The gateway:
+For destructive actions (e.g., `restart_deployment` in prod, `scale_deployment` to 0), the policy engine returns `require_approval: true`. The gateway (`app/approvals.py`, `app/slack.py`, `app/sse_hub.py`):
 
-1. Persists the pending tool call to Redis with a TTL (default: 15 minutes).
-2. Sends a Slack message (or webhook to PagerDuty) with the action details and an approve/deny link.
-3. Holds the agent's SSE connection open (or returns a `202 Pending` with a polling endpoint).
-4. Executes or rejects the tool call once a human responds, then logs the approval event.
+1. Persists the pending tool call to Redis with a TTL (15 minutes) and returns `202` with the `approval_id` immediately — the agent's request does not block on a human.
+2. Sends a Slack message via Incoming Webhook with the action details and an approve/deny link (PagerDuty webhook is not implemented — Slack only).
+3. `POST /admin/approvals/{id}/decide` is the Slack interactive-callback target; it verifies `X-Slack-Signature` (HMAC + timestamp, rejecting both forgeries and replays) before acting.
+4. On decision, the gateway executes (or skips) the tool call synchronously inside that same request, logs the approval event, and pushes the result to the agent's still-open `/mcp/sse` connection if one exists.
+
+The SSE push is in-process pub/sub (`app/sse_hub.py`) — it works for the single gateway process this runs as today, but doesn't fan out across pods. A multi-replica deployment needs that hub backed by Redis pub/sub (the same Redis instance already used for rate limiting and approval state) instead; not built.
 
 ### 3.5 Audit Log (PostgreSQL)
 
-An append-only table with row-level SHA-256 chaining to make tampering evident. Each row contains:
+Implemented: `app/audit.py` (write/query/verify/export), `app/db.py` (asyncpg pool),
+`migrations/versions/0001_create_audit_tables.py` (schema, via Alembic). An append-only table with
+row-level SHA-256 chaining to make tampering evident. Each row (`audit_log`) contains:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | `uuid` | Primary key |
-| `seq` | `bigint` | Monotonic sequence number |
+| `seq` | `bigserial` | Primary key - monotonic sequence number, what the hash chain orders on |
+| `id` | `uuid` | Unique per-row identifier, independent of insert order |
 | `agent_id` | `text` | Resolved from API key |
+| `role` | `text` | Agent's role at call time |
 | `tool_name` | `text` | MCP tool name |
-| `args` | `jsonb` | Sanitized arguments |
-| `policy_decision` | `jsonb` | OPA output |
-| `approval_id` | `uuid` | FK to approvals table (nullable) |
-| `result_status` | `text` | `success` / `denied` / `error` |
-| `result_summary` | `jsonb` | Truncated result or error |
-| `duration_ms` | `int` | End-to-end latency |
-| `otel_trace_id` | `text` | Correlation to OTel trace |
-| `row_hash` | `text` | SHA-256(`prev_hash` + row data) |
+| `args` | `jsonb` | Tool call arguments |
+| `policy_decision` | `jsonb` | `{"reason": ...}` from the OPA decision (or the gateway's own denial reason) |
+| `approval_id` | `uuid`, nullable | The approval this row is attached to, if any - **no FK** to `approvals` (deliberate: the audit writer's uptime must never depend on that table's state; see `app/audit.py`'s module docstring) |
+| `result_status` | `text` | `allowed` / `denied` / `error` / `pending_approval` / `executor_timeout` / `approval_denied` |
+| `result_summary` | `jsonb`, nullable | The tool's result, on success |
+| `duration_ms` | `int`, nullable | End-to-end handler latency |
+| `otel_trace_id` | `text`, nullable | Correlation to OTel trace - always `NULL` today, no OTel SDK wired up yet (Phase 6) |
+| `row_hash` | `text` | SHA-256(`prev_hash` + `id` + `agent_id` + `tool_name` + `args` + `result_summary` + `created_at`) |
 | `created_at` | `timestamptz` | Immutable insert time |
 
-The `row_hash` chain allows offline verification that no rows have been modified or deleted since initial write.
+The `row_hash` chain allows offline verification that no rows have been modified or deleted since
+initial write: `app/audit.py::verify_rows` recomputes each row's hash against its true predecessor
+(fetched fresh by `seq - 1`, not just the previous row in whatever filtered page was requested) and
+flags the first mismatch. `GET /admin/audit` surfaces this as `integrity_check: "pass" | "fail"` on
+every query. Writes are serialized with a Postgres advisory lock (one global lock across the whole
+gateway) so two concurrent tool calls can never both read the same `prev_hash` and corrupt the chain.
+
+A companion `approvals` table exists in the same migration (mirroring `app/approvals.py`'s Redis
+`Approval` fields) so `audit_log.approval_id` has something to conceptually point at, but nothing
+writes to it yet - approval state today lives only in Redis, with its 15-minute TTL (Phase 4). A
+durable Postgres copy of approval history is future work, not part of this pass.
+
+**Retention policy:** 90 days live in PostgreSQL, 7 years in S3 Glacier after that. Only the export
+half is implemented: `scripts/export_audit_to_s3.py`, run daily by
+`.github/workflows/audit-export.yml`, streams the prior UTC day's rows to
+`s3://<bucket>/audit-log/<date>.ndjson`. Neither the 90-day Postgres deletion nor the S3
+lifecycle-to-Glacier transition is automated anywhere in this repo - the former would be a
+scheduled `DELETE FROM audit_log WHERE created_at < now() - interval '90 days'` (e.g. `pg_cron`),
+the latter an S3 bucket lifecycle rule (Terraform, Phase 7 - Infrastructure as Code - which hasn't
+started). The export workflow itself also can't run for real yet: it needs `AUDIT_LOG_S3_BUCKET`
+and friends configured as repo secrets against an actual deployed Postgres/S3, and this project has
+no deployed environment yet.
 
 ---
 

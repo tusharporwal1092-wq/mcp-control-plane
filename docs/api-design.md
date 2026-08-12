@@ -168,21 +168,27 @@ Authorization: Bearer <key>
     "content": [
       {
         "type": "text",
-        "text": "This action requires human approval. Approval request sent to #sre-approvals in Slack. Approval ID: appr-7f3a..."
+        "text": "This action requires human approval. Approval request sent to Slack. Approval ID: 7f3a2b9c-..."
       }
     ],
     "isError": false,
     "_meta": {
-      "approval_id": "appr-7f3a2b9c-...",
+      "approval_id": "7f3a2b9c-...",
       "approval_status": "pending",
-      "expires_at": "2026-07-24T10:30:00Z",
-      "poll_url": "/admin/approvals/appr-7f3a2b9c-.../status"
+      "expires_at": 1753349100.0,
+      "poll_url": "/admin/approvals/7f3a2b9c-.../status"
     }
   }
 }
 ```
+HTTP status is `202`. `approval_id` is a plain UUID4 (no `appr-` prefix), and `expires_at` is a Unix
+timestamp (seconds, float) rather than an ISO 8601 string - both match what `app/approvals.py`
+actually stores in Redis, so the field the agent parses is the field the server put there, with no
+reformatting step in between.
 
-The agent may poll `GET /admin/approvals/{approval_id}/status` or listen on the SSE stream for the completion event.
+The agent may poll `GET /admin/approvals/{approval_id}/status` or listen on the SSE stream
+(`GET /mcp/sse`, `event: approval_result`) for the completion event, which carries the same shape:
+`{"approval_id", "tool_name", "status": "approved"|"denied"|"error", "result"|"error"}`.
 
 ### 3.4 Error Codes
 
@@ -253,9 +259,15 @@ Immediately revokes all keys for that agent. In-flight requests are rejected.
 
 ### 4.2 Audit Log
 
+Implemented by `app/main.py::get_audit_log`/`export_audit_log_endpoint`, backed by `app/audit.py`
+(schema: `migrations/versions/0001_create_audit_tables.py`). Like `/admin/approvals/*`, these routes
+are exempt from the agent `x-api-key` middleware (`PUBLIC_PATH_PREFIXES` in
+`app/middleware/auth.py`) since an agent's tool-scoped key is the wrong credential for an admin
+endpoint - see the note there about the admin JWT (S2.2) not being built yet.
+
 #### Query audit log
 ```
-GET /admin/audit?agent_id=sre-agent-prod-01&tool=restart_deployment&from=2026-07-24T00:00:00Z&to=2026-07-24T23:59:59Z&result_status=denied&limit=50&offset=0
+GET /admin/audit?agent_id=agent01&tool=restart_deployment&from=2026-07-24T00:00:00Z&to=2026-07-24T23:59:59Z&result_status=denied&limit=50&offset=0
 ```
 
 Query parameters:
@@ -264,9 +276,9 @@ Query parameters:
 |-----------|------|-------------|
 | `agent_id` | string | Filter by agent |
 | `tool` | string | Filter by tool name |
-| `from` | ISO 8601 | Start of time range |
-| `to` | ISO 8601 | End of time range |
-| `result_status` | string | `success`, `denied`, `error` |
+| `from` | ISO 8601 | Start of time range (`created_at >=`) |
+| `to` | ISO 8601 | End of time range (`created_at <=`) |
+| `result_status` | string | `allowed`, `denied`, `error`, `pending_approval`, `executor_timeout`, `approval_denied` - the same vocabulary `AuditEvent.decision` uses everywhere else in this codebase, not a separate `success`/`denied`/`error` set |
 | `limit` | int | Max rows (default 50, max 500) |
 | `offset` | int | Pagination offset |
 
@@ -278,32 +290,55 @@ Query parameters:
     {
       "id": "a3f12c9d-...",
       "seq": 10041,
-      "agent_id": "sre-agent-prod-01",
+      "agent_id": "agent01",
+      "role": "sre1",
       "tool_name": "restart_deployment",
       "args": { "namespace": "payments", "deployment": "checkout-api" },
-      "policy_decision": { "allow": false, "reason": "prod requires approval" },
+      "policy_decision": { "reason": "restart_deployment is a destructive action in prod and requires approval" },
       "approval_id": null,
       "result_status": "denied",
       "result_summary": null,
       "duration_ms": 12,
-      "otel_trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
-      "created_at": "2026-07-24T10:15:03Z"
+      "otel_trace_id": null,
+      "row_hash": "b7e2...",
+      "created_at": "2026-07-24T10:15:03+00:00"
     }
   ],
   "integrity_check": "pass"
 }
 ```
 
-The `integrity_check` field re-validates the SHA-256 hash chain across the returned rows. If any row has been tampered with, it returns `"fail"` with the first broken `seq`.
+`rows` is ordered newest-first (`seq DESC`). `otel_trace_id` is always `null` today - no OTel SDK is
+wired up yet (Phase 6). The `integrity_check` field re-validates the SHA-256 hash chain across the
+returned rows (`app/audit.py::verify_rows`): each row's hash is recomputed against its *true*
+predecessor by `seq`, fetched fresh from the table rather than just the previous row in this
+(possibly filtered, possibly paginated) response - a filtered page can skip seq numbers, so "the
+previous row in the list" isn't necessarily the chain predecessor. If any row's stored hash doesn't
+match, the response adds `"first_broken_seq": <seq>` alongside `"integrity_check": "fail"`.
 
 #### Export audit log (for compliance)
 ```
 GET /admin/audit/export?from=2026-07-01T00:00:00Z&to=2026-07-31T23:59:59Z
 Accept: application/x-ndjson
 ```
-Returns newline-delimited JSON, streaming. Includes all fields plus `row_hash` for offline chain verification.
+`from`/`to` are both required (no default range). Returns newline-delimited JSON, streamed via an
+asyncpg server-side cursor (`app/audit.py::export_audit_log`) rather than loaded into memory up
+front, ordered oldest-first (`seq ASC`). Each line is one row, same shape as the query endpoint's
+`rows[]` entries (including `row_hash`, for offline chain verification, and `role`) - no
+`integrity_check` on the export itself; verify by re-running the same hash computation offline, or
+by querying the same range through `GET /admin/audit` first.
+
+`scripts/export_audit_to_s3.py` is the scheduled consumer of this same underlying function
+(`app/audit.py::export_audit_log`, called directly rather than over HTTP) - see docs/architecture.md
+S3.5 "Retention policy".
 
 ### 4.3 Approval Management
+
+Both endpoints below are exempt from the agent `x-api-key` middleware (see `PUBLIC_PATH_PREFIXES`
+in `app/middleware/auth.py`) since they authenticate differently: `/decide` via the Slack HMAC
+below, `/status` not at all yet — a real deploy would still put the admin JWT (S2.2) in front of
+it, but that JWT layer isn't built anywhere in this codebase, so it's called out here rather than
+silently assumed.
 
 #### Get approval status
 ```
@@ -311,22 +346,28 @@ GET /admin/approvals/{approval_id}/status
 ```
 ```json
 {
-  "approval_id": "appr-7f3a2b9c-...",
+  "id": "7f3a2b9c-...",
   "agent_id": "sre-agent-prod-01",
+  "role": "sre",
   "tool_name": "restart_deployment",
-  "args": { "namespace": "payments", "deployment": "checkout-api" },
+  "arguments": { "namespace": "payments", "deployment": "checkout-api" },
+  "reason": "restart_deployment is a destructive action in prod and requires approval",
   "status": "pending",
-  "requested_at": "2026-07-24T10:15:00Z",
-  "expires_at": "2026-07-24T10:30:00Z",
+  "requested_at": 1753348200.0,
+  "expires_at": 1753349100.0,
   "decided_by": null,
   "decided_at": null
 }
 ```
+Returns `410 Gone` if the id is unknown or its 15-minute TTL has elapsed — Redis can't
+distinguish "never existed" from "expired", so neither does this endpoint.
 
 #### Approve or deny (webhook target for Slack)
 ```
 POST /admin/approvals/{approval_id}/decide
 Content-Type: application/json
+X-Slack-Request-Timestamp: 1753348210
+X-Slack-Signature: v0=...
 
 {
   "decision": "approve",
@@ -335,12 +376,22 @@ Content-Type: application/json
 }
 ```
 
-This endpoint is called by the Slack interactive component callback. It is protected by a shared HMAC secret verified against the `X-Slack-Signature` header.
+This is the Slack interactive-callback target. `app/slack.py::verify_signature` checks two things
+before the body is even parsed: the `v0=` HMAC-SHA256 over `v0:{timestamp}:{raw body}` (Slack's
+signing scheme), and that the timestamp is within 5 minutes of now — a captured, validly-signed
+request replayed later is rejected on the timestamp check alone, independent of the HMAC.
+
+On approval, the gateway calls the tool executor directly (no second OPA check — a human already
+authorized it) and writes the result to the audit log; on denial, it writes an `approval_denied`
+audit entry instead. Either way, the outcome is pushed to the agent's open SSE connection
+(`app/sse_hub.py`) if one exists, in addition to being fetchable via `/status`.
 
 **Response:**
-- `200 OK` — decision recorded, tool call proceeds or is cancelled
-- `410 Gone` — approval expired (TTL elapsed)
-- `409 Conflict` — already decided
+- `200 OK` — decision recorded: `{"approval_id": "...", "status": "approved"|"denied"}`. On
+  approval, this returns once the (now-synchronous) executor call has finished.
+- `401 Unauthorized` — missing/invalid `X-Slack-Signature`, or a timestamp outside the 5-minute window
+- `410 Gone` — approval not found or expired (TTL elapsed)
+- `409 Conflict` — already decided (a duplicate/replayed callback for a resolved approval)
 
 ### 4.4 Health & Readiness
 
