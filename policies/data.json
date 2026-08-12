@@ -7,7 +7,9 @@
         "get_deployment_status",
         "restart_deployment",
         "scale_deployment",
-        "read_prometheus_metrics"
+        "read_prometheus_metrics",
+        "exec_into_pod",
+        "apply_k8s_manifest"
       ],
       "allowed_environments": ["dev", "staging", "prod"],
       "allowed_namespaces": ["*"]
@@ -37,5 +39,7 @@
       "allowed_namespaces": ["*"]
     }
   },
-  "destructive_tools": ["restart_deployment", "scale_deployment", "trigger_jenkins_job"]
+  "destructive_tools": ["restart_deployment", "scale_deployment", "trigger_jenkins_job"],
+  "always_require_approval_tools": ["exec_into_pod", "apply_k8s_manifest"],
+  "kube_system_blocked_tools": ["restart_deployment", "exec_into_pod", "apply_k8s_manifest"]
 }

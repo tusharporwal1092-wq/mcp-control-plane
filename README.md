@@ -22,6 +22,9 @@ implemented:
 - 7 read-only tool executors calling real downstream APIs (Kubernetes, Terraform Cloud, Jenkins,
   Prometheus, PagerDuty/Jira), plus the 3 write tools (`restart_deployment`, `scale_deployment`,
   `trigger_jenkins_job`) — `docs/roadmap.md` Phases 3-4.
+- 2 higher-risk stretch tools, `exec_into_pod` and `apply_k8s_manifest` (`docs/roadmap.md` Phase 10):
+  same Python `kubernetes` client, `sre1`-only, hard-blocked against `kube-system`, and gated behind
+  approval in *every* environment (not just prod, unlike the write tools above).
 - Human-in-the-loop approval gate for `require_approval` policy decisions: pending approvals are
   persisted to Redis with a 15-minute TTL, a Slack Incoming Webhook notifies with approve/deny
   buttons, and `POST /admin/approvals/{id}/decide` (HMAC-verified, replay-protected) resumes the
@@ -49,8 +52,9 @@ Agent → POST /mcp → [log] → [authn] → [rate limit] → interceptor → O
 - `app/middleware/rate_limit.py` — Redis sliding-window limiter
 - `app/interceptor.py` — validates/normalizes `tools/call` params into an OPA input document
 - `app/authz/opa.py` — calls the OPA sidecar, maps its response to allow/deny/require_approval
-- `app/tools/tools_spec.py` — tool executors, 7 read-only + 3 write (all call real downstream APIs)
-- `app/tools/k8s_client.py` — cached K8s API clients + ApiException/timeout -> `ExecutorError` mapping
+- `app/tools/tools_spec.py` — tool executors, 7 read-only + 5 write (all call real downstream APIs)
+- `app/tools/k8s_client.py` — cached K8s API clients (CoreV1Api/AppsV1Api + a generic DynamicClient
+  for `apply_k8s_manifest`) + ApiException/timeout -> `ExecutorError` mapping
 - `app/tools/errors.py`, `app/tools/config.py` — shared `ExecutorError` type and the 10s/30s executor timeout
 - `app/approvals.py` — Redis-backed pending-approval store (create / decide, 15-minute TTL)
 - `app/slack.py` — Slack Incoming Webhook notification + `X-Slack-Signature` HMAC verification

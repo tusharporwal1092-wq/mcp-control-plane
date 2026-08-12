@@ -330,13 +330,56 @@ These items are not required for a complete, shippable project but represent mea
 | Item | Value | Complexity |
 |------|-------|-----------|
 | Multi-tenant agent namespacing | Allows multiple teams/orgs to share the gateway with full isolation | High |
-| Additional tools: `exec_into_pod`, `apply_k8s_manifest` | Higher-value but higher-risk tools (require stricter policy + approval) | Medium |
+| ~~Additional tools: `exec_into_pod`, `apply_k8s_manifest`~~ | **Done.** See below. | Medium |
 | `tools/list` per-agent cache (Redis) | Reduces OPA load for agents that call `tools/list` frequently | Low |
 | Grafana SLO dashboards | Error budget tracking for the control plane itself | Medium |
 | OPA policy dry-run endpoint | Allows admins to test a proposed policy change against historical tool calls before deploying | High |
 | Agent activity anomaly detection | Flag agents whose call patterns deviate significantly from their baseline | High |
 | Short-lived API keys (1–7 day expiry) | Reduces blast radius of key compromise; requires auto-rotation integration | Medium |
 | WebSocket transport for MCP | Lower latency for high-frequency tool-calling agents | Medium |
+
+### `exec_into_pod` / `apply_k8s_manifest`
+
+Implemented via the Python `kubernetes` client, same as every other K8s tool (`app/tools/tools_spec.py`,
+`app/tools/k8s_client.py`):
+
+- [x] `exec_into_pod` — `kubernetes.stream.stream()` against `CoreV1Api.connect_get_namespaced_pod_exec`.
+      `command` must be a list of strings (no shell wrapping - the K8s exec API runs it directly, so
+      there's no shell-metacharacter injection surface to guard against). Bounded by the same
+      `get_executor_timeout()` (10s default / 30s max) every other K8s tool uses, threaded through to
+      the exec websocket's own read loop - a stuck command gets its connection cut at the timeout
+      instead of hanging the request indefinitely. Output capped at 4,000 characters
+      (`EXEC_OUTPUT_MAX_CHARS`), same "don't become a bulk exfiltration channel" concern
+      docs/threat-model.md T-08 already raises for `get_pod_logs`.
+- [x] `apply_k8s_manifest` — server-side apply (`kubectl apply --server-side`'s underlying mechanism)
+      via `kubernetes.dynamic.DynamicClient`, since arbitrary-kind apply needs generic resource
+      discovery that the hardcoded `CoreV1Api`/`AppsV1Api` clients don't provide. Rejects cluster-scoped
+      resources outright (namespaced only) and rejects a `manifest.metadata.namespace` that disagrees
+      with the top-level `namespace` argument - both close a real gap where the namespace OPA actually
+      checked and the namespace ultimately mutated could otherwise differ.
+- [x] **Mandatory login for every action** — both tools go through the exact same
+      authenticate → rate_limit → interceptor → OPA → executor → audit pipeline as every other tool;
+      nothing tool-specific was needed since `x-api-key` auth is already unconditional for `/mcp`.
+- [x] **Namespace restriction** — both tools take `namespace` as a required top-level argument, so the
+      existing per-role `allowed_namespaces` allowlist (`policies/authz.rego`) applies automatically;
+      no new namespace-checking code needed. `kube_system_blocked_tools` (`policies/data.json`) hard-blocks
+      both against `kube-system` regardless of role, extending the same override `restart_deployment`
+      already had.
+- [x] **Stricter approval policy** — a new `always_require_approval_tools` list
+      (`policies/data.json`/`policies/authz.rego`) gates both tools behind human approval in *every*
+      environment, not just prod the way `restart_deployment`/`scale_deployment` are - their blast
+      radius (arbitrary code execution; arbitrary resource creation/mutation) isn't bounded by
+      environment the way a known deployment's restart is.
+- [x] **Mandatory audit logging** — no new code needed here either: every `record_tool_call(...)` call
+      site in `app/main.py` already covers every tool by name, unconditionally.
+- [x] Scoped to the `sre1` role only (not `deploy-bot`/`readonly`) in both `policies/data.json` and
+      `API_KEYS` (`app/middleware/auth.py`) - these are the two highest-risk tools in the tool set and
+      CI/CD automation has no business running an interactive-shaped exec or an arbitrary manifest apply.
+
+Tests: `tests/test_tools_executors.py` (executor logic, K8s client faked at the boundary),
+`policies/authz_test.rego` (the stricter-than-`destructive_tools` policy, the `kube-system` block,
+role scoping), `tests/test_opa_docker_integration.py` (real OPA end-to-end: approval required outside
+prod, blocked in `kube-system`).
 
 ---
 

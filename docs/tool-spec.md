@@ -2,7 +2,7 @@
 
 ## Overview
 
-The MCP Control Plane exposes 10 tools across four domains: Kubernetes, Terraform, Jenkins, and Observability/Incident Management. Each tool section describes its purpose, input schema, output schema, policy constraints, audit fields, rate limit behavior, and failure modes.
+The MCP Control Plane exposes 12 tools across four domains: Kubernetes, Terraform, Jenkins, and Observability/Incident Management. Each tool section describes its purpose, input schema, output schema, policy constraints, audit fields, rate limit behavior, and failure modes.
 
 All tools follow the MCP tool-call convention: input via `arguments` object, output via `content` array. Tools never return raw credentials, internal stack traces, or data outside their defined scope.
 
@@ -23,6 +23,14 @@ All tools follow the MCP tool-call convention: input via `arguments` object, out
 | `read_prometheus_metrics` | ✓ | ✓ | ✓ | — | No |
 | `open_ticket` | ✓ | ✓ | — | — | No |
 | `read_ticket` | ✓ | ✓ | ✓ | — | No |
+| `exec_into_pod` | — | — | — | — | **all environments: yes** |
+| `apply_k8s_manifest` | — | — | — | — | **all environments: yes** |
+
+`exec_into_pod`/`apply_k8s_manifest` aren't on this docs-era role table at all (they're stretch-goal
+tools, added after this table's `sre`/`oncall`/`readonly`/`deploy-bot`/`destroy-requires-approval`
+role set was written) - as actually implemented, both are scoped to the `sre1` role only (see
+`policies/data.json`), gated behind approval in every environment rather than "prod: yes" the way
+`restart_deployment`/`scale_deployment`/`trigger_jenkins_job` are.
 
 ---
 
@@ -295,6 +303,170 @@ payment-svc-abc123-p7r2x      1/1     Running   0          2d
 - Scaling above 10 replicas in staging requires approval.
 - All prod scaling requires approval.
 - OPA rule: `scale_deployment` blocked in `kube-system`.
+
+---
+
+### Tool: `exec_into_pod`
+
+**Purpose:** Run a command inside a running pod's container - `kubectl exec` equivalent. Stretch-goal
+tool (docs/roadmap.md Phase 10): "higher-value but higher-risk," gated accordingly (see Policy
+Constraints below).
+
+**Executor:** K8s Python client, `kubernetes.stream.stream()` against `CoreV1Api.connect_get_namespaced_pod_exec`
+**IRSA Role:** `k8s-exec-role` (the `pods/exec` subresource only - no other permissions; a separate,
+narrower role than `k8s-writer-role` since exec is a fundamentally different risk class from patching
+a deployment)
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "enum": ["payments", "orders", "auth", "notifications", "infra"]
+    },
+    "pod_name": { "type": "string" },
+    "container": {
+      "type": "string",
+      "description": "Optional. Required if the pod has more than one container."
+    },
+    "command": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "Argument vector - run directly, not through a shell. Use [\"/bin/sh\", \"-c\", \"...\"] explicitly if shell semantics (pipes, redirection) are needed."
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    }
+  },
+  "required": ["namespace", "pod_name", "command", "reason"],
+  "additionalProperties": false
+}
+```
+
+**Output:**
+```json
+{
+  "status": "executed",
+  "namespace": "payments",
+  "pod_name": "checkout-api-7d9f4b-xkp2q",
+  "container": null,
+  "command": ["/bin/sh", "-c", "cat /app/config.yaml"],
+  "output": "...",
+  "output_truncated": false,
+  "timeout_seconds": 10,
+  "executed_at": "2026-08-12T10:20:00Z"
+}
+```
+`output` is capped at 4,000 characters (`output_truncated: true` past that) - the same "don't let a
+tool become a bulk exfiltration channel" concern docs/threat-model.md T-08 already applies to
+`get_pod_logs`.
+
+**Policy Constraints:**
+- Allowed for role `sre` only (not `deploy-bot`, not `readonly`).
+- Requires approval in **every** environment (dev/staging/prod), not just prod - see
+  `always_require_approval_tools` in `policies/data.json`. Arbitrary command execution has no
+  environment-scoped blast radius the way a known deployment restart does.
+- OPA rule: never allowed against `kube-system`, regardless of role or environment.
+- The command itself runs directly (no shell) - the executor never invokes a shell to interpret it,
+  so there's no shell-metacharacter injection surface from the argument list.
+- Bounded by the shared executor timeout (10s default / 30s max, `EXECUTOR_TIMEOUT_SECONDS`) - a
+  command that doesn't return gets its exec session terminated at the timeout rather than holding
+  the connection (and the gateway request) open indefinitely.
+
+**Approval Flow:** Same shape as `restart_deployment`'s (docs/api-design.md S3.3/S4.3) - the gateway
+returns `202` with a pending `approval_id`, Slack is notified, and the command only actually runs
+after a human approves via `POST /admin/approvals/{id}/decide`.
+
+**Audit Log Fields:**
+```json
+{
+  "tool": "exec_into_pod",
+  "args": { "namespace": "payments", "pod_name": "checkout-api-7d9f4b-xkp2q", "command": ["/bin/sh", "-c", "cat /app/config.yaml"], "reason": "Verifying deployed config matches expected values" },
+  "approval_id": "...",
+  "result_status": "allowed"
+}
+```
+
+---
+
+### Tool: `apply_k8s_manifest`
+
+**Purpose:** Server-side apply (`kubectl apply --server-side`'s underlying mechanism) of a single
+Kubernetes manifest against a namespace. Stretch-goal tool (docs/roadmap.md Phase 10), gated the same
+way as `exec_into_pod`.
+
+**Executor:** K8s Python client, `kubernetes.dynamic.DynamicClient` (generic resource discovery +
+`server_side_apply`) - the hardcoded `CoreV1Api`/`AppsV1Api` clients every other tool uses only cover
+specific kinds, so an arbitrary-manifest tool needs the dynamic client instead.
+**IRSA Role:** `k8s-apply-role` (namespaced-resource create/patch only - no cluster-scoped
+permissions, matching the executor's own refusal to apply cluster-scoped resources below)
+
+**Input Schema:**
+```json
+{
+  "type": "object",
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "enum": ["payments", "orders", "auth", "notifications", "infra"]
+    },
+    "manifest": {
+      "type": "object",
+      "description": "A single Kubernetes manifest (apiVersion, kind, metadata.name required). If metadata.namespace is set, it must match the top-level `namespace` argument.",
+      "required": ["apiVersion", "kind", "metadata"]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    }
+  },
+  "required": ["namespace", "manifest", "reason"],
+  "additionalProperties": false
+}
+```
+
+**Output:**
+```json
+{
+  "status": "applied",
+  "kind": "Deployment",
+  "api_version": "apps/v1",
+  "name": "checkout-api",
+  "namespace": "payments",
+  "applied_at": "2026-08-12T10:20:00Z",
+  "message": "Server-side apply submitted."
+}
+```
+
+**Policy Constraints:**
+- Allowed for role `sre` only.
+- Requires approval in **every** environment, not just prod - same `always_require_approval_tools`
+  rule as `exec_into_pod`. Arbitrary resource creation/mutation (potentially including RBAC objects
+  that grant further privilege) is not a blast radius environment alone bounds.
+- OPA rule: never allowed against `kube-system`, regardless of role or environment.
+- Cluster-scoped resources (e.g. `Namespace`, `ClusterRole`) are rejected by the executor itself,
+  independent of OPA - `apply_k8s_manifest` only supports namespaced resources.
+- `manifest.metadata.namespace`, if present, must match the top-level `namespace` argument (the one
+  OPA's namespace allowlist actually evaluated) - a mismatch is rejected rather than silently
+  trusted, so a call approved for namespace A can't be used to mutate namespace B.
+
+**Approval Flow:** Same shape as `restart_deployment`'s.
+
+**Audit Log Fields:**
+```json
+{
+  "tool": "apply_k8s_manifest",
+  "args": { "namespace": "payments", "manifest": { "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "checkout-api" } }, "reason": "Rolling out updated resource limits" },
+  "approval_id": "...",
+  "result_status": "allowed"
+}
+```
 
 ---
 

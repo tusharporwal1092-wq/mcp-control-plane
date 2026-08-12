@@ -12,6 +12,18 @@ these functions if a human approves via the Slack callback
 never calls the executor at all. `open_ticket` remains a stub - it's outside
 Phase 4's tool list (only the three above), not blocked on the gate itself.
 
+Phase 10 (stretch) adds `exec_into_pod` and `apply_k8s_manifest` - "higher-value
+but higher-risk" tools per docs/roadmap.md. Both ride the exact same
+authenticate -> rate_limit -> interceptor -> OPA -> executor -> audit pipeline
+as every other tool (nothing tool-specific was needed for "mandatory login" or
+"mandatory audit logging" - those are already unconditional gateway-wide
+properties, see app/middleware/auth.py and app/main.py's record_tool_call
+calls), but get a *stricter* OPA policy than restart_deployment/
+scale_deployment: `always_require_approval_tools` in policies/data.json gates
+them behind human approval in every environment, not just prod, and
+`kube_system_blocked_tools` hard-blocks them against kube-system regardless
+of role (see policies/authz.rego).
+
 Every executor:
 - validates the arguments it needs and raises ExecutorError("validation_error", ...)
   if they're missing (full JSON-Schema validation per docs/tool-spec.md is the
@@ -27,6 +39,7 @@ import os
 from datetime import datetime, timezone
 
 import httpx
+from kubernetes.stream import stream
 
 from . import k8s_client as k8s
 from .config import get_executor_timeout
@@ -222,6 +235,132 @@ def scale_deployment(arguments: dict):
         "replicas": replicas,
         "scaled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "message": "Scale request submitted. Monitor with get_deployment_status.",
+    }
+
+
+# exec output is capped the same way docs/threat-model.md T-08 caps
+# get_pod_logs output (default 500 lines / max 2000 there) - a command that
+# dumps a secret or a large file out through this tool shouldn't become an
+# unbounded exfiltration channel just because exec has no server-side line
+# limit the way `kubectl logs --tail` does.
+EXEC_OUTPUT_MAX_CHARS = 4000
+
+
+def exec_into_pod(arguments: dict):
+    namespace = arguments.get("namespace")
+    pod_name = arguments.get("pod_name")
+    command = arguments.get("command")
+    if not namespace or not pod_name:
+        raise ExecutorError("validation_error", "'namespace' and 'pod_name' are required")
+    # A list, not a shell string: the K8s exec API runs `command` directly
+    # (no shell), so there's no shell-metacharacter injection surface here -
+    # accepting a raw string and wrapping it in `sh -c` would add exactly
+    # that surface for no real benefit.
+    if not isinstance(command, list) or not command or not all(isinstance(c, str) and c for c in command):
+        raise ExecutorError("validation_error", "'command' is required and must be a non-empty list of strings")
+    _require_reason(arguments)
+
+    container = arguments.get("container")
+    exec_kwargs = {"command": command, "stderr": True, "stdin": False, "stdout": True, "tty": False}
+    if container:
+        exec_kwargs["container"] = container
+
+    # k8s.run() injects `_request_timeout=get_executor_timeout()` into this
+    # call, which `stream()` forwards all the way down to the exec
+    # websocket's own read loop (kubernetes.stream.ws_client.WSClient.
+    # run_forever(timeout=...)) - so a command that never returns gets its
+    # connection cut at the timeout instead of hanging indefinitely, same
+    # guarantee every other tool in this module already has.
+    output = k8s.run(
+        lambda **kw: stream(core_v1_api().connect_get_namespaced_pod_exec, **kw),
+        f"pod '{pod_name}' in namespace '{namespace}'",
+        name=pod_name,
+        namespace=namespace,
+        **exec_kwargs,
+    )
+
+    # ponytail: run_forever() cutting the connection at the timeout doesn't
+    # raise - it just stops reading, so a truly hung command looks the same
+    # as one that finished right at the boundary. Not distinguished here;
+    # upgrade path is dropping to the lower-level WSClient API (_preload_
+    # content=False) if that distinction ever becomes operationally important.
+    truncated = len(output) > EXEC_OUTPUT_MAX_CHARS
+    if truncated:
+        output = output[:EXEC_OUTPUT_MAX_CHARS]
+
+    return {
+        "status": "executed",
+        "namespace": namespace,
+        "pod_name": pod_name,
+        "container": container,
+        "command": command,
+        "output": output,
+        "output_truncated": truncated,
+        "timeout_seconds": get_executor_timeout(),
+        "executed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def apply_k8s_manifest(arguments: dict):
+    namespace = arguments.get("namespace")
+    manifest = arguments.get("manifest")
+    if not namespace:
+        raise ExecutorError("validation_error", "'namespace' is required")
+    if not isinstance(manifest, dict):
+        raise ExecutorError("validation_error", "'manifest' is required and must be an object")
+    _require_reason(arguments)
+
+    api_version = manifest.get("apiVersion")
+    kind = manifest.get("kind")
+    if not api_version or not kind:
+        raise ExecutorError("validation_error", "manifest must include 'apiVersion' and 'kind'")
+
+    metadata = manifest.get("metadata") or {}
+    name = metadata.get("name")
+    if not name:
+        raise ExecutorError("validation_error", "manifest.metadata.name is required")
+
+    # `namespace` (the top-level argument) is what app/interceptor.py reads
+    # for OPA's namespace allowlist - a manifest whose own metadata.namespace
+    # disagreed would let a call approved for namespace A actually mutate
+    # namespace B, so that's rejected outright rather than silently trusted
+    # or silently overwritten.
+    manifest_namespace = metadata.get("namespace")
+    if manifest_namespace and manifest_namespace != namespace:
+        raise ExecutorError(
+            "validation_error",
+            f"manifest.metadata.namespace ('{manifest_namespace}') must match the 'namespace' argument ('{namespace}')",
+        )
+    manifest = {**manifest, "metadata": {**metadata, "namespace": namespace}}
+
+    resource_client = k8s.resource_for(api_version, kind)
+    if not resource_client.namespaced:
+        raise ExecutorError(
+            "validation_error",
+            f"'{kind}' is a cluster-scoped resource; apply_k8s_manifest only supports namespaced resources",
+        )
+
+    # Server-side apply (the same mechanism `kubectl apply --server-side`
+    # uses): the API server does the merge, so this tool doesn't need to
+    # fetch-then-diff-then-patch itself for every possible kind.
+    k8s.run(
+        resource_client.server_side_apply,
+        f"{kind} '{name}' in namespace '{namespace}'",
+        body=manifest,
+        name=name,
+        namespace=namespace,
+        field_manager="mcp-control-plane",
+        force_conflicts=True,
+    )
+
+    return {
+        "status": "applied",
+        "kind": kind,
+        "api_version": api_version,
+        "name": name,
+        "namespace": namespace,
+        "applied_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "message": "Server-side apply submitted.",
     }
 
 

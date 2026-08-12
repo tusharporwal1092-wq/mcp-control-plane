@@ -147,3 +147,49 @@ def test_sre_restart_deployment_in_prod_requires_approval(real_opa_client):
     body = response.json()
     assert body["result"]["_meta"]["approval_status"] == "pending"
     assert body["result"]["_meta"]["approval_id"]
+
+
+def test_sre_exec_into_pod_requires_approval_even_outside_prod(real_opa_client, monkeypatch):
+    # The whole point of `always_require_approval_tools` (policies/data.json,
+    # docs/roadmap.md Phase 10 "stricter policy"): unlike restart_deployment
+    # above, exec_into_pod must require approval in *every* environment, not
+    # just prod. "dev-payments" here is deliberately non-prod.
+    async def _no_slack(approval):
+        return None
+
+    monkeypatch.setattr(app_main.slack, "send_approval_request", _no_slack)
+
+    response = real_opa_client.post(
+        "/mcp",
+        json=rpc(
+            "tools/call",
+            {
+                "name": "exec_into_pod",
+                "arguments": {"namespace": "dev-payments", "pod_name": "checkout-api-xyz", "command": ["ls"]},
+            },
+        ),
+        headers={"x-api-key": "test_key"},
+    )
+    assert response.status_code == 202
+    body = response.json()
+    assert body["result"]["_meta"]["approval_status"] == "pending"
+
+
+def test_apply_k8s_manifest_blocked_in_kube_system_regardless_of_role(real_opa_client):
+    response = real_opa_client.post(
+        "/mcp",
+        json=rpc(
+            "tools/call",
+            {
+                "name": "apply_k8s_manifest",
+                "arguments": {
+                    "namespace": "kube-system",
+                    "manifest": {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "x"}},
+                    "reason": "should never reach the executor",
+                },
+            },
+        ),
+        headers={"x-api-key": "test_key"},
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["data"]["policy_decision"] == "deny"

@@ -1,13 +1,16 @@
 """Unit tests for the tool executors in app/tools/tools_spec.py: Phase 3's 7
-read-only tools plus Phase 4's 3 write tools (restart_deployment,
-scale_deployment, trigger_jenkins_job).
+read-only tools, Phase 4's 3 write tools (restart_deployment,
+scale_deployment, trigger_jenkins_job), and Phase 10's 2 higher-risk stretch
+tools (exec_into_pod, apply_k8s_manifest).
 
 Each downstream client (Kubernetes, Terraform Cloud, Jenkins, Prometheus,
 PagerDuty, Jira) is faked at the boundary the executor actually calls
 through, so the real error-mapping logic (kubernetes ApiException/timeout ->
 ExecutorError in app/tools/k8s_client.py, httpx status/timeout -> ExecutorError
 in tools_spec._send) is exercised for real - only the network call itself
-is replaced.
+is replaced. exec_into_pod fakes `kubernetes.stream.stream` itself (imported
+into tools_spec's namespace) rather than the K8s API client, since the real
+call goes through that function, not a plain CoreV1Api method.
 """
 import sys
 from pathlib import Path
@@ -20,6 +23,7 @@ from kubernetes.client.exceptions import ApiException
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.tools import tools_spec  # noqa: E402
+from app.tools.config import get_executor_timeout  # noqa: E402
 from app.tools.errors import ExecutorError  # noqa: E402
 
 _REQUEST = httpx.Request("GET", "http://test")
@@ -180,6 +184,179 @@ def test_scale_deployment_rejects_out_of_range_replicas():
             {"namespace": "payments", "deployment": "checkout-api", "replicas": 25, "reason": "scaling up for load"}
         )
     assert exc_info.value.error_type == "validation_error"
+
+
+def test_exec_into_pod_runs_command_and_returns_output(monkeypatch):
+    captured = {}
+
+    def fake_stream(func, **kwargs):
+        captured.update(kwargs)
+        return "hello from pod\n"
+
+    monkeypatch.setattr(tools_spec, "stream", fake_stream)
+    monkeypatch.setattr(
+        tools_spec, "core_v1_api", lambda: SimpleNamespace(connect_get_namespaced_pod_exec=lambda **k: None)
+    )
+
+    result = tools_spec.exec_into_pod(
+        {
+            "namespace": "payments",
+            "pod_name": "checkout-api-xyz",
+            "command": ["/bin/sh", "-c", "echo hello"],
+            "reason": "checking container filesystem state",
+        }
+    )
+
+    assert result["status"] == "executed"
+    assert result["output"] == "hello from pod\n"
+    assert result["output_truncated"] is False
+    assert captured["command"] == ["/bin/sh", "-c", "echo hello"]
+    assert captured["namespace"] == "payments"
+    assert captured["name"] == "checkout-api-xyz"
+    # k8s.run() must bound this call the same way it bounds every other K8s
+    # call - a stuck exec session should not hang the gateway indefinitely.
+    assert captured["_request_timeout"] == get_executor_timeout()
+
+
+def test_exec_into_pod_rejects_non_list_command():
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.exec_into_pod(
+            {"namespace": "payments", "pod_name": "x", "command": "echo hi", "reason": "should fail validation here"}
+        )
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_exec_into_pod_rejects_empty_command():
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.exec_into_pod(
+            {"namespace": "payments", "pod_name": "x", "command": [], "reason": "should fail validation here"}
+        )
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_exec_into_pod_missing_reason_is_validation_error(monkeypatch):
+    monkeypatch.setattr(tools_spec, "stream", lambda func, **kwargs: "")
+    monkeypatch.setattr(
+        tools_spec, "core_v1_api", lambda: SimpleNamespace(connect_get_namespaced_pod_exec=lambda **k: None)
+    )
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.exec_into_pod({"namespace": "payments", "pod_name": "x", "command": ["ls"]})
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_exec_into_pod_truncates_long_output(monkeypatch):
+    long_output = "x" * (tools_spec.EXEC_OUTPUT_MAX_CHARS + 500)
+    monkeypatch.setattr(tools_spec, "stream", lambda func, **kwargs: long_output)
+    monkeypatch.setattr(
+        tools_spec, "core_v1_api", lambda: SimpleNamespace(connect_get_namespaced_pod_exec=lambda **k: None)
+    )
+
+    result = tools_spec.exec_into_pod(
+        {"namespace": "payments", "pod_name": "x", "command": ["cat", "bigfile"], "reason": "checking large file contents"}
+    )
+
+    assert result["output_truncated"] is True
+    assert len(result["output"]) == tools_spec.EXEC_OUTPUT_MAX_CHARS
+
+
+def test_exec_into_pod_not_found_maps_to_not_found(monkeypatch):
+    def raise_404(func, **kwargs):
+        raise ApiException(status=404, reason="Not Found")
+
+    monkeypatch.setattr(tools_spec, "stream", raise_404)
+    monkeypatch.setattr(
+        tools_spec, "core_v1_api", lambda: SimpleNamespace(connect_get_namespaced_pod_exec=lambda **k: None)
+    )
+
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.exec_into_pod(
+            {"namespace": "payments", "pod_name": "missing", "command": ["ls"], "reason": "checking pod contents here"}
+        )
+    assert exc_info.value.error_type == "not_found"
+
+
+def test_apply_k8s_manifest_calls_server_side_apply(monkeypatch):
+    captured = {}
+
+    def fake_server_side_apply(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    fake_resource = SimpleNamespace(namespaced=True, server_side_apply=fake_server_side_apply)
+    monkeypatch.setattr(tools_spec.k8s, "resource_for", lambda api_version, kind: fake_resource)
+
+    manifest = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "checkout-api"},
+        "spec": {"replicas": 3},
+    }
+    result = tools_spec.apply_k8s_manifest(
+        {"namespace": "payments", "manifest": manifest, "reason": "rolling out new deployment config"}
+    )
+
+    assert result["status"] == "applied"
+    assert result["kind"] == "Deployment"
+    assert result["name"] == "checkout-api"
+    assert captured["namespace"] == "payments"
+    assert captured["name"] == "checkout-api"
+    # manifest.metadata.namespace gets filled in from the top-level
+    # `namespace` argument - the one OPA's namespace allowlist actually checked.
+    assert captured["body"]["metadata"]["namespace"] == "payments"
+    assert captured["field_manager"] == "mcp-control-plane"
+
+
+def test_apply_k8s_manifest_rejects_namespace_mismatch():
+    manifest = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "cfg", "namespace": "other-ns"}}
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.apply_k8s_manifest(
+            {"namespace": "payments", "manifest": manifest, "reason": "updating configmap values here"}
+        )
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_apply_k8s_manifest_rejects_cluster_scoped_resource(monkeypatch):
+    fake_resource = SimpleNamespace(namespaced=False, server_side_apply=lambda **k: None)
+    monkeypatch.setattr(tools_spec.k8s, "resource_for", lambda api_version, kind: fake_resource)
+
+    manifest = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "new-namespace"}}
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.apply_k8s_manifest(
+            {"namespace": "payments", "manifest": manifest, "reason": "provisioning a new namespace here"}
+        )
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_apply_k8s_manifest_missing_kind_is_validation_error():
+    manifest = {"apiVersion": "v1", "metadata": {"name": "cfg"}}
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.apply_k8s_manifest(
+            {"namespace": "payments", "manifest": manifest, "reason": "testing missing kind field here"}
+        )
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_apply_k8s_manifest_missing_metadata_name_is_validation_error():
+    manifest = {"apiVersion": "v1", "kind": "ConfigMap", "metadata": {}}
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.apply_k8s_manifest(
+            {"namespace": "payments", "manifest": manifest, "reason": "testing missing name field here"}
+        )
+    assert exc_info.value.error_type == "validation_error"
+
+
+def test_apply_k8s_manifest_unknown_resource_type_is_not_found(monkeypatch):
+    def fake_resource_for(api_version, kind):
+        raise ExecutorError("not_found", f"resource type '{kind}' not found")
+
+    monkeypatch.setattr(tools_spec.k8s, "resource_for", fake_resource_for)
+
+    manifest = {"apiVersion": "bogus/v1", "kind": "Bogus", "metadata": {"name": "x"}}
+    with pytest.raises(ExecutorError) as exc_info:
+        tools_spec.apply_k8s_manifest(
+            {"namespace": "payments", "manifest": manifest, "reason": "testing unknown resource kind here"}
+        )
+    assert exc_info.value.error_type == "not_found"
 
 
 # --- Terraform Cloud ------------------------------------------------------

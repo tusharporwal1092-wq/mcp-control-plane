@@ -53,6 +53,8 @@ API_KEYS: dict[str, Agent_data] = {
             "restart_deployment",
             "scale_deployment",
             "read_prometheus_metrics",
+            "exec_into_pod",
+            "apply_k8s_manifest",
         ],
     ),
 }

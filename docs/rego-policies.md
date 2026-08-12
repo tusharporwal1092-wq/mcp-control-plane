@@ -11,7 +11,7 @@ this doc covers the policy as actually implemented today.
 |------|---------|
 | `policies/authz.rego` | The `authz` package: `allow` / `require_approval` rules |
 | `policies/authz_test.rego` | `opa test` cases for `authz` |
-| `policies/data.json` | Static role registry, loaded into `data.roles` / `data.destructive_tools` |
+| `policies/data.json` | Static role registry, loaded into `data.roles` / `data.destructive_tools` / `data.always_require_approval_tools` / `data.kube_system_blocked_tools` |
 
 `data.json` is merged into the root of `data` because it's named exactly
 `data.json` — that's an OPA convention, not something this project configured.
@@ -61,16 +61,29 @@ Four independent conditions, all of which must hold for `allow`:
 - **`namespace_allowed`** — argument policy. `input.resource.namespace` must
   be in the role's `allowed_namespaces`, or that list contains `"*"`, or
   there's no namespace to check (same bypass logic as above).
-- **`kube_system_restart_blocked`** (inverted: `not kube_system_restart_blocked`)
-  — a hard override, not role-dependent: `restart_deployment` against
-  `kube-system` is always denied, per `docs/tool-spec.md`.
+- **`kube_system_blocked`** (inverted: `not kube_system_blocked`) — a hard
+  override, not role-dependent: any tool in `data.kube_system_blocked_tools`
+  (`restart_deployment`, `exec_into_pod`, `apply_k8s_manifest`) is always
+  denied against `kube-system`, per `docs/tool-spec.md`. Data-driven rather
+  than one rule per tool, so adding another blocked tool is a one-line
+  `data.json` change, not a new Rego rule.
 
-`require_approval` only evaluates once `allow` is already true: it adds a
-second condition (`input.tool.name in data.destructive_tools` and
-`input.environment == "prod"`) on top. `allow: true, require_approval: true`
-means "permitted, but gated on a human" — see the `-32010` branch in
-`app/main.py`. The actual approval workflow (Slack, Redis TTL) is a later
-phase; today the gateway just returns 403 with that decision surfaced.
+`require_approval` has two independent rule bodies (Rego ORs them
+automatically - either one being true makes the whole rule true), both
+gated on `allow` already being true:
+- `input.tool.name in data.destructive_tools` **and** `input.environment == "prod"`
+  — `restart_deployment`, `scale_deployment`, `trigger_jenkins_job`: bounded
+  blast radius, so only prod needs a human.
+- `input.tool.name in data.always_require_approval_tools` — `exec_into_pod`,
+  `apply_k8s_manifest`: approval in *every* environment they're allowed in,
+  since arbitrary exec/apply doesn't have an environment-scoped blast radius
+  the way restarting a known deployment does.
+
+`allow: true, require_approval: true` means "permitted, but gated on a
+human" — the approval gate (Redis-backed pending state, Slack notification,
+HMAC-verified callback) is implemented in app/approvals.py, app/slack.py,
+and the `require_approval` branch of `app/main.py`'s `/mcp` handler
+(docs/roadmap.md Phase 4).
 
 ## Adding a role
 

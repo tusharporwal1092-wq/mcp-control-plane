@@ -7,7 +7,7 @@ all_tools := {
 	"get_pod_logs", "list_pods", "get_deployment_status",
 	"restart_deployment", "scale_deployment", "query_terraform_plan",
 	"trigger_jenkins_job", "get_jenkins_job_status", "read_prometheus_metrics",
-	"open_ticket", "read_ticket",
+	"open_ticket", "read_ticket", "exec_into_pod", "apply_k8s_manifest",
 }
 
 all_environments := {"dev", "staging", "prod"}
@@ -107,4 +107,36 @@ test_restart_deployment_blocked_in_kube_system_regardless_of_role if {
 
 test_tool_without_namespace_bypasses_environment_check if {
 	decision("readonly", "read_ticket", "unknown", null)
+}
+
+# --- exec_into_pod / apply_k8s_manifest: stricter than the other destructive
+# tools - approval in every environment, not just prod (docs/roadmap.md
+# Phase 10 "higher-value but higher-risk... require stricter policy + approval") ---
+
+test_sre_exec_into_pod_requires_approval_in_every_environment if {
+	every env in {"dev", "staging", "prod"} {
+		decision("sre1", "exec_into_pod", env, "payments")
+		requires_approval("sre1", "exec_into_pod", env, "payments")
+	}
+}
+
+test_sre_apply_k8s_manifest_requires_approval_in_every_environment if {
+	every env in {"dev", "staging", "prod"} {
+		decision("sre1", "apply_k8s_manifest", env, "payments")
+		requires_approval("sre1", "apply_k8s_manifest", env, "payments")
+	}
+}
+
+test_exec_into_pod_and_apply_k8s_manifest_blocked_in_kube_system if {
+	not decision("sre1", "exec_into_pod", "dev", "kube-system")
+	not decision("sre1", "apply_k8s_manifest", "dev", "kube-system")
+}
+
+test_readonly_and_deploy_bot_cannot_exec_into_pod_or_apply_manifests if {
+	every role in {"readonly", "deploy-bot"} {
+		every env in all_environments {
+			not decision(role, "exec_into_pod", env, "payments")
+			not decision(role, "apply_k8s_manifest", env, "payments")
+		}
+	}
 }

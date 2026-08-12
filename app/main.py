@@ -94,6 +94,8 @@ TOOLS = {
     "get_deployment_status": tools.get_deployment_status,
     "restart_deployment": tools.restart_deployment,
     "scale_deployment": tools.scale_deployment,
+    "exec_into_pod": tools.exec_into_pod,
+    "apply_k8s_manifest": tools.apply_k8s_manifest,
     "query_terraform_plan": tools.query_terraform_plan,
     "trigger_jenkins_job": tools.trigger_jenkins_job,
     "get_jenkins_job_status": tools.get_jenkins_job_status,
@@ -400,7 +402,7 @@ async def decide_approval(approval_id: str, request: Request):
     # request's own AuditEvent rows (denied, or the resumed-executor result)
     # get a duration_ms too.
     start = time.perf_counter()
-
+    #to calculate how long the approval request took to processs in ms.
     def _duration_ms() -> int:
         return int((time.perf_counter() - start) * 1000)
 
