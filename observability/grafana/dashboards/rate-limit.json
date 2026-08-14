@@ -1,0 +1,42 @@
+{
+  "uid": "mcp-rate-limit",
+  "title": "MCP Control Plane / Rate Limit",
+  "tags": ["mcp-control-plane"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Rate-limit hits/min by agent",
+      "description": "app/middleware/rate_limit.py::rate_limit increments rate_limit_hits_total every time a request is rejected with 429 - one row per rejected request, not per agent per window.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqpm" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (agent_id) (rate(rate_limit_hits_total[1m])) * 60",
+          "legendFormat": "{{agent_id}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Total rate-limit hits (selected range)",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(rate_limit_hits_total[$__range]))"
+        }
+      ]
+    }
+  ]
+}

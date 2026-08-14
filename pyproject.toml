@@ -14,6 +14,10 @@ dependencies = [
     "asyncpg>=0.31.0",
     "alembic>=1.19.1",
     "sqlalchemy>=2.0.51",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
 ]
 
 [project.optional-dependencies]

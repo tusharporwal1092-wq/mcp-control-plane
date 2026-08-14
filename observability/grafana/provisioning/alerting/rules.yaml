@@ -1,0 +1,124 @@
+# docs/roadmap.md Phase 6's four alerts. Each rule queries Prometheus for an
+# instant vector (one value per label set, e.g. per tool_name) and feeds it
+# straight into a `threshold` server-side expression - Grafana evaluates one
+# alert instance per series, so "denial rate > 20%" fires per offending tool
+# rather than one alert covering the whole gateway.
+#
+# noDataState: OK on every rule - discovered the hard way (test-fired these
+# against a real stack): Grafana's default noDataState is "Alerting", and a
+# counter with zero series (e.g. audit_chain_integrity_failures_total before
+# its first .add() call, or before any tool has ever been denied) reads as
+# "no data", not "0" - a fleet with a perfectly clean audit chain would page
+# PagerDuty immediately and constantly under the default. "No data yet" is
+# the healthy state for all four of these, so it shouldn't alert.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: mcp-control-plane-alerts
+    folder: MCP Control Plane
+    interval: 1m
+    rules:
+      - uid: mcp-alert-denial-rate
+        title: Denial rate > 20% sustained 5 minutes
+        condition: threshold
+        for: 5m
+        noDataState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.tool_name }} denial rate has been above 20% for 5+ minutes"
+        data:
+          - refId: query
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              instant: true
+              expr: 100 * sum by (tool_name) (rate(tool_calls_total{result_status="denied"}[5m])) / sum by (tool_name) (rate(tool_calls_total[5m]))
+          - refId: threshold
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [20] }
+
+      - uid: mcp-alert-p95-latency
+        title: p95 tool call latency > 5s
+        condition: threshold
+        for: 5m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.tool_name }} p95 latency is above 5000ms"
+        data:
+          - refId: query
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              instant: true
+              expr: histogram_quantile(0.95, sum by (le, tool_name) (rate(tool_call_duration_ms_milliseconds_bucket[5m])))
+          - refId: threshold
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [5000] }
+
+      - uid: mcp-alert-approval-queue
+        title: Approval queue > 10 pending
+        condition: threshold
+        for: 1m
+        noDataState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $values.query }} approvals are currently pending (threshold: 10)"
+        data:
+          - refId: query
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              instant: true
+              expr: sum(approvals_pending)
+          - refId: threshold
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [10] }
+
+      - uid: mcp-alert-audit-chain-failure
+        title: Audit log hash chain failure
+        condition: threshold
+        for: 0m
+        noDataState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: "GET /admin/audit's integrity check found a broken hash-chain row - possible audit log tampering"
+        data:
+          - refId: query
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: query
+              instant: true
+              expr: sum(increase(audit_chain_integrity_failures_total[5m]))
+          - refId: threshold
+            datasourceUid: __expr__
+            model:
+              refId: threshold
+              type: threshold
+              expression: query
+              conditions:
+                - evaluator: { type: gt, params: [0] }

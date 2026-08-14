@@ -1,0 +1,18 @@
+# Routes each alert rule (observability/grafana/provisioning/alerting/rules.yaml)
+# by its `severity` label - `critical` (PagerDuty-worthy: denial spike, audit
+# chain break) vs `warning` (Slack-worthy: latency, approval backlog).
+apiVersion: 1
+
+policies:
+  - orgId: 1
+    receiver: slack-alerts
+    group_by: ["alertname"]
+    routes:
+      - receiver: pagerduty-critical
+        object_matchers:
+          - ["severity", "=", "critical"]
+        continue: false
+      - receiver: slack-alerts
+        object_matchers:
+          - ["severity", "=", "warning"]
+        continue: false

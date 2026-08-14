@@ -1,0 +1,65 @@
+{
+  "uid": "mcp-denial-rate",
+  "title": "MCP Control Plane / Denial Rate",
+  "tags": ["mcp-control-plane"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "% denied by tool",
+      "description": "Denied tool calls (policy or gateway-scope denial) as a percentage of all completed tool calls for that tool, over a 5m window.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 * sum by (tool_name) (rate(tool_calls_total{result_status=\"denied\"}[5m])) / sum by (tool_name) (rate(tool_calls_total[5m]))",
+          "legendFormat": "{{tool_name}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "% denied by role",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "percent", "min": 0, "max": 100 },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 * sum by (role) (rate(tool_calls_total{result_status=\"denied\"}[5m])) / sum by (role) (rate(tool_calls_total[5m]))",
+          "legendFormat": "{{role}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "OPA policy_denials_total rate, by tool and role",
+      "description": "Raw denial rate from the policy decision point (app/authz/opa.py) - includes fail-closed denials when OPA itself is unreachable, unlike the audit_log-derived panels above.",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (tool_name, role) (rate(policy_denials_total[5m]))",
+          "legendFormat": "{{tool_name}} / {{role}}"
+        }
+      ]
+    }
+  ]
+}

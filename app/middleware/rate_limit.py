@@ -19,6 +19,8 @@ import redis.asyncio as redis
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 
+from ..otel import rate_limit_hits_total
+
 logger = logging.getLogger(__name__)
 
 RATE_LIMIT_WINDOW_SECONDS = 60
@@ -106,6 +108,7 @@ async def rate_limit(request: Request, call_next):
     limit_result = await limiter.check(str(agent.id), agent.rate_limit_rpm)
 
     if not limit_result.allowed:
+        rate_limit_hits_total.add(1, {"agent_id": str(agent.id)})
         return JSONResponse(
             _rpc_error(
                 None,

@@ -163,7 +163,16 @@ async def test_every_tool_call_gets_an_audit_row(real_audit_client, db_pool):
 
     async with db_pool.acquire() as conn:
         count = await conn.fetchval("SELECT COUNT(*) FROM audit_log WHERE tool_name = 'list_pods'")
+        trace_ids = await conn.fetch("SELECT otel_trace_id FROM audit_log WHERE tool_name = 'list_pods'")
     assert count == 3
+    # Phase 6: every row written inside a real request carries the request's
+    # trace id (app/audit.py::_current_trace_id) - a real span exists (and
+    # gets a real random trace id) whether or not an OTLP collector is
+    # actually listening, so this doesn't need OTEL_EXPORTER_OTLP_ENDPOINT set.
+    for row in trace_ids:
+        assert row["otel_trace_id"] is not None
+        assert len(row["otel_trace_id"]) == 32
+        int(row["otel_trace_id"], 16)  # valid hex
 
 
 async def test_hash_chain_tamper_is_detected(db_pool):

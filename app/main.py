@@ -31,6 +31,7 @@ from typing import Any
 
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from opentelemetry import trace
 from pydantic import BaseModel, ValidationError
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -43,6 +44,7 @@ from .interceptor import MissingParamError, intercept_tool_call
 from .middleware.auth import authenticate
 from .middleware.logging import log_requests
 from .middleware.rate_limit import RATE_LIMIT_WINDOW_SECONDS, SlidingWindowRateLimiter, rate_limit
+from .otel import instrument_app, tracer
 from .redis_client import create_redis_client
 from .tools import tools_spec as tools
 from .tools.errors import ExecutorError
@@ -66,6 +68,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Create the server instance.
 app = FastAPI()
+instrument_app(app)  # OTel: one server span + http.server.* metrics per request
 
 # For logging the request.
 logger = logging.getLogger(__name__)
@@ -118,15 +121,26 @@ class ExecutionOutcome:
 
 
 def _execute_tool(tool_name: str, arguments: dict) -> ExecutionOutcome:
-    try:
-        result = TOOLS[tool_name](arguments)
-    except ExecutorError as exc:
-        logger.warning("Executor error for tool %s: %s (%s)", tool_name, exc, exc.error_type)
-        return ExecutionOutcome(kind="executor_error", error_type=exc.error_type, message=str(exc))
-    except Exception as exc:
-        logger.exception("Unhandled executor error for tool %s", tool_name)
-        return ExecutionOutcome(kind="unhandled_error", message=str(exc))
-    return ExecutionOutcome(kind="success", result=result)
+    # Shared by both call sites that ever run an executor (the /mcp handler
+    # below and decide_approval's post-approval resume) - one span here
+    # covers both instead of wrapping each call site separately.
+    with tracer.start_as_current_span("executor") as span:
+        span.set_attribute("tool_name", tool_name)
+        start = time.perf_counter()
+        try:
+            result = TOOLS[tool_name](arguments)
+        except ExecutorError as exc:
+            logger.warning("Executor error for tool %s: %s (%s)", tool_name, exc, exc.error_type)
+            span.set_attribute("error_type", exc.error_type)
+            span.set_attribute("duration_ms", int((time.perf_counter() - start) * 1000))
+            return ExecutionOutcome(kind="executor_error", error_type=exc.error_type, message=str(exc))
+        except Exception as exc:
+            logger.exception("Unhandled executor error for tool %s", tool_name)
+            span.record_exception(exc)
+            span.set_attribute("duration_ms", int((time.perf_counter() - start) * 1000))
+            return ExecutionOutcome(kind="unhandled_error", message=str(exc))
+        span.set_attribute("duration_ms", int((time.perf_counter() - start) * 1000))
+        return ExecutionOutcome(kind="success", result=result)
 
 
 # Make a class for tool calling format.
@@ -209,6 +223,15 @@ async def mcp(request: Request):
         tool_name = context.tool_name
         arguments = context.arguments
 
+        # Span attributes per docs/roadmap.md Phase 6: set on the request's
+        # own auto-instrumented span (there's no manually-opened span active
+        # here) so they show up on the trace root in Tempo, not buried in a
+        # child.
+        current_span = trace.get_current_span()
+        current_span.set_attribute("agent_id", context.agent_id)
+        current_span.set_attribute("tool_name", tool_name)
+        current_span.set_attribute("environment", context.environment)
+
         if tool_name not in TOOLS:
             return JSONResponse(
                 _rpc_error(
@@ -236,6 +259,8 @@ async def mcp(request: Request):
             )
 
         decision = await evaluate_policy(context)
+        policy_decision_label = "require_approval" if decision.require_approval else ("allow" if decision.allow else "deny")
+        current_span.set_attribute("policy_decision", policy_decision_label)
         if decision.require_approval:
             approval = await approvals.create_pending_approval(
                 request.app.state.redis,

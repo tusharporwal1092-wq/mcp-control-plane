@@ -1,0 +1,39 @@
+{
+  "uid": "mcp-audit-integrity",
+  "title": "MCP Control Plane / Audit Chain Integrity",
+  "tags": ["mcp-control-plane"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Hash chain breaks (selected range)",
+      "description": "audit_chain_integrity_failures_total, incremented by app/audit.py::query_audit_log whenever a GET /admin/audit call's hash-chain verification fails. Zero here means every check that ran passed - it does NOT mean nobody's checked (see the alert rule's own description for the difference).",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(increase(audit_chain_integrity_failures_total[$__range]))"
+        }
+      ]
+    }
+  ]
+}

@@ -16,6 +16,8 @@ from typing import Any
 
 import redis.asyncio as redis
 
+from .otel import approval_decision_duration_ms, approval_requests_total, approvals_pending
+
 APPROVAL_TTL_SECONDS = 15 * 60
 _KEY_PREFIX = "approval:"
 
@@ -55,6 +57,8 @@ async def create_pending_approval(
         expires_at=now + APPROVAL_TTL_SECONDS,
     )
     await redis_client.set(_key(approval.id), json.dumps(asdict(approval)), ex=APPROVAL_TTL_SECONDS)
+    approval_requests_total.add(1, {"tool_name": tool_name})
+    approvals_pending.add(1, {"tool_name": tool_name})
     return approval
 
 
@@ -93,4 +97,8 @@ async def decide_approval(
     # a duplicate callback with 409, not forever - it can expire on the same
     # 15-minute clock the pending approval was already running on.
     await redis_client.set(_key(approval_id), json.dumps(asdict(approval)), keepttl=True)
+    approvals_pending.add(-1, {"tool_name": approval.tool_name})
+    approval_decision_duration_ms.record(
+        (approval.decided_at - approval.requested_at) * 1000, {"tool_name": approval.tool_name}
+    )
     return approval, "decided"

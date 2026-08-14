@@ -195,7 +195,7 @@ row-level SHA-256 chaining to make tampering evident. Each row (`audit_log`) con
 | `result_status` | `text` | `allowed` / `denied` / `error` / `pending_approval` / `executor_timeout` / `approval_denied` |
 | `result_summary` | `jsonb`, nullable | The tool's result, on success |
 | `duration_ms` | `int`, nullable | End-to-end handler latency |
-| `otel_trace_id` | `text`, nullable | Correlation to OTel trace - always `NULL` today, no OTel SDK wired up yet (Phase 6) |
+| `otel_trace_id` | `text`, nullable | Correlation to OTel trace - populated from the active span's trace id (app/audit.py::_current_trace_id) as of Phase 6; still `NULL` for rows written outside a request context (e.g. a direct test call to record_tool_call with no active span) |
 | `row_hash` | `text` | SHA-256(`prev_hash` + `id` + `agent_id` + `tool_name` + `args` + `result_summary` + `created_at`) |
 | `created_at` | `timestamptz` | Immutable insert time |
 

@@ -34,12 +34,17 @@ implemented:
   Alembic. `GET /admin/audit` queries it with filters/pagination and an `integrity_check` that
   recomputes the hash chain; `GET /admin/audit/export` streams the same data as NDJSON. A daily
   script/workflow exports the prior day's rows to S3 — see `docs/roadmap.md` Phase 5.
+- OpenTelemetry traces + metrics across the whole request path (`authn` → `policy_eval` →
+  `executor` → `audit_write` spans, `tool_calls_total`/`policy_denials_total`/
+  `approval_requests_total`/`rate_limit_hits_total`/`tool_call_duration_ms` and friends), an OTel
+  collector + Tempo + Prometheus + Grafana stack in `docker-compose.yaml`, 6 provisioned Grafana
+  dashboards and 4 alert rules under `observability/` — see `docs/roadmap.md` Phase 6.
 
-Not yet built: observability (OTel/Grafana — `otel_trace_id` is always `null` for now), admin JWT
-auth in front of `/admin/approvals/*` and `/admin/audit*` (both currently have no auth of their
-own beyond the approval-decide endpoint's Slack HMAC check), and automated retention enforcement
-(the 90-day Postgres deletion and S3-to-Glacier lifecycle rule are documented but not scheduled
-anywhere) — see the roadmap for sequencing.
+Not yet built: admin JWT auth in front of `/admin/approvals/*` and `/admin/audit*` (both currently
+have no auth of their own beyond the approval-decide endpoint's Slack HMAC check), automated
+retention enforcement (the 90-day Postgres deletion and S3-to-Glacier lifecycle rule are
+documented but not scheduled anywhere), and the EKS DaemonSet variant of the OTel collector (no
+cluster exists yet - Phase 7) — see the roadmap for sequencing.
 
 ## Architecture
 
@@ -88,7 +93,8 @@ uv sync
 
 ### Run
 
-Everything (gateway + Redis + Postgres + OPA) via Docker Compose:
+Everything (gateway + Redis + Postgres + OPA + the OTel collector/Tempo/Prometheus/Grafana
+observability stack) via Docker Compose:
 
 ```bash
 docker compose up
@@ -101,6 +107,12 @@ reaching it from outside Compose):
 ```bash
 docker compose run --rm gateway alembic upgrade head
 ```
+
+Grafana is at http://localhost:3000 (anonymous admin access, no login screen - local dev only).
+The 6 dashboards and 4 alert rules under `observability/grafana/` are provisioned automatically.
+The PagerDuty/Slack contact points (`observability/grafana/provisioning/alerting/contact-points.yaml`)
+ship with placeholder values and will provision cleanly either way - replace them with a real
+integration key/webhook URL before an alert needs to actually page anyone.
 
 Or the gateway alone against local dependencies (Redis, Postgres, OPA each running separately).
 Apply the audit-log schema once before the first run:

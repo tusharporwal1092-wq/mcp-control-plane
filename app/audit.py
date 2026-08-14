@@ -25,6 +25,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
+from opentelemetry import trace
+
+from .otel import audit_chain_integrity_failures_total, tool_call_duration_ms, tool_calls_total, tracer
 
 logger = logging.getLogger("audit")
 
@@ -78,51 +81,82 @@ def _decode_jsonb(value):
     return json.loads(value)
 
 
+def _current_trace_id() -> str | None:
+    """Hex trace id of whatever span is active when this is called (the
+    request's auto-instrumented FastAPI span, by the time record_tool_call
+    runs) - lets an audit_log row be looked up straight from its Tempo
+    trace. None outside any span (e.g. a test that calls this directly)."""
+    span_context = trace.get_current_span().get_span_context()
+    if not span_context.is_valid:
+        return None
+    return format(span_context.trace_id, "032x")
+
+
 async def record_tool_call(pool: asyncpg.Pool, event: AuditEvent) -> None:
     """Persist one audit event as a new, chained row. Call this after every
     policy decision and after every tool execution (success or failure)."""
-    # This row's own identity, independent of where it lands in the chain.
-    row_id = str(uuid.uuid4())
-    created_at = datetime.fromtimestamp(event.timestamp, tz=timezone.utc)
-    created_at_iso = created_at.isoformat()
+    with tracer.start_as_current_span("audit_write") as span:
+        span.set_attribute("agent_id", event.agent_id)
+        span.set_attribute("tool_name", event.tool_name)
+        span.set_attribute("policy_decision", event.decision)
+        if event.duration_ms is not None:
+            span.set_attribute("duration_ms", event.duration_ms)
 
-    async with pool.acquire() as conn, conn.transaction():
-        # Serializes the read-prev-hash-then-insert sequence across
-        # concurrent requests, so two writers can never chain off the same
-        # prev_hash - released automatically when the transaction ends.
-        await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", CHAIN_LOCK_KEY)
+        # This row's own identity, independent of where it lands in the chain.
+        row_id = str(uuid.uuid4())
+        created_at = datetime.fromtimestamp(event.timestamp, tz=timezone.utc)
+        created_at_iso = created_at.isoformat()
+        otel_trace_id = _current_trace_id()
 
-        # Chain off whatever the current last row's hash is - GENESIS_HASH
-        # if this is the very first row the table has ever seen.
-        prev_hash = await conn.fetchval("SELECT row_hash FROM audit_log ORDER BY seq DESC LIMIT 1")
-        if prev_hash is None:
-            prev_hash = GENESIS_HASH
+        async with pool.acquire() as conn, conn.transaction():
+            # Serializes the read-prev-hash-then-insert sequence across
+            # concurrent requests, so two writers can never chain off the same
+            # prev_hash - released automatically when the transaction ends.
+            await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", CHAIN_LOCK_KEY)
 
-        row_hash = _row_hash(prev_hash, row_id, event.agent_id, event.tool_name, event.arguments, event.result, created_at_iso)
+            # Chain off whatever the current last row's hash is - GENESIS_HASH
+            # if this is the very first row the table has ever seen.
+            prev_hash = await conn.fetchval("SELECT row_hash FROM audit_log ORDER BY seq DESC LIMIT 1")
+            if prev_hash is None:
+                prev_hash = GENESIS_HASH
 
-        # Single INSERT writes the row and its hash together, still inside
-        # the advisory-locked transaction, so no other writer can slip a row
-        # in between "we read prev_hash" and "we wrote our row".
-        await conn.execute(
-            """
-            INSERT INTO audit_log
-                (id, agent_id, role, tool_name, args, policy_decision, approval_id,
-                 result_status, result_summary, duration_ms, row_hash, created_at)
-            VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6::jsonb, $7::uuid, $8, $9::jsonb, $10, $11, $12)
-            """,
-            row_id,
-            event.agent_id,
-            event.role,
-            event.tool_name,
-            json.dumps(event.arguments, default=str),
-            json.dumps({"reason": event.reason}),
-            event.approval_id,
-            event.decision,
-            json.dumps(event.result, default=str) if event.result is not None else None,
-            event.duration_ms,
-            row_hash,
-            created_at,
+            row_hash = _row_hash(prev_hash, row_id, event.agent_id, event.tool_name, event.arguments, event.result, created_at_iso)
+
+            # Single INSERT writes the row and its hash together, still inside
+            # the advisory-locked transaction, so no other writer can slip a row
+            # in between "we read prev_hash" and "we wrote our row".
+            await conn.execute(
+                """
+                INSERT INTO audit_log
+                    (id, agent_id, role, tool_name, args, policy_decision, approval_id,
+                     result_status, result_summary, duration_ms, otel_trace_id, row_hash, created_at)
+                VALUES ($1::uuid, $2, $3, $4, $5::jsonb, $6::jsonb, $7::uuid, $8, $9::jsonb, $10, $11, $12, $13)
+                """,
+                row_id,
+                event.agent_id,
+                event.role,
+                event.tool_name,
+                json.dumps(event.arguments, default=str),
+                json.dumps({"reason": event.reason}),
+                event.approval_id,
+                event.decision,
+                json.dumps(event.result, default=str) if event.result is not None else None,
+                event.duration_ms,
+                otel_trace_id,
+                row_hash,
+                created_at,
+            )
+
+        # tool_calls_total/tool_call_duration_ms: this is the one call site
+        # every outcome (allowed, denied, pending_approval, error, ...)
+        # already routes through, so it's also the one place that needs to
+        # know about the Phase 6 metrics - no per-outcome instrumentation
+        # scattered across app/main.py.
+        tool_calls_total.add(
+            1, {"tool_name": event.tool_name, "result_status": event.decision, "role": event.role}
         )
+        if event.duration_ms is not None:
+            tool_call_duration_ms.record(event.duration_ms, {"tool_name": event.tool_name})
 
     # Keep the old stdout log line too - cheap, human-grep-able, and doesn't
     # depend on the DB write having succeeded to be useful during an outage.
@@ -258,6 +292,9 @@ async def query_audit_log(
     # docstring for why that's still a meaningful check on a filtered page.
     rows = [dict(r) for r in records]
     status, first_broken_seq = await verify_rows(pool, rows)
+    if status == "fail":
+        logger.error("audit_log hash chain broken at seq=%s", first_broken_seq)
+        audit_chain_integrity_failures_total.add(1)
     return total, rows, status, first_broken_seq
 
 

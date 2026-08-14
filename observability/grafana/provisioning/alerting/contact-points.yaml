@@ -1,0 +1,38 @@
+# Placeholder integration key/webhook URL, not an env var: tried
+# `$PAGERDUTY_INTEGRATION_KEY`/`$SLACK_WEBHOOK_URL` (sourced from the
+# `grafana` service's environment in docker-compose.yaml, itself reading
+# from the shell/.env - unset by default, same no-op-without-secrets shape
+# as scripts/export_audit_to_s3.py's AUDIT_LOG_* vars, since no deployed
+# environment exists yet per CLAUDE.md) and found Grafana's alerting
+# provisioning does *not* tolerate an empty required field the way
+# datasource provisioning does - an unset var here crashes the whole
+# container at startup ("could not find integration key property in
+# settings"), instead of just leaving the contact point unable to send.
+# A clearly-fake placeholder boots cleanly either way; replace both values
+# with the real integration key / webhook URL before this can actually page
+# anyone.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: pagerduty-critical
+    receivers:
+      - uid: pagerduty-critical-receiver
+        type: pagerduty
+        settings:
+          integrationKey: REPLACE_WITH_REAL_PAGERDUTY_INTEGRATION_KEY
+          severity: critical
+          class: mcp-control-plane
+
+  - orgId: 1
+    name: slack-alerts
+    receivers:
+      - uid: slack-alerts-receiver
+        type: slack
+        settings:
+          url: https://hooks.slack.com/services/REPLACE/WITH/REAL_WEBHOOK
+          title: |
+            {{ len .Alerts.Firing }} firing, {{ len .Alerts.Resolved }} resolved
+          text: |
+            {{ range .Alerts }}{{ .Labels.alertname }}: {{ .Annotations.summary }}
+            {{ end }}

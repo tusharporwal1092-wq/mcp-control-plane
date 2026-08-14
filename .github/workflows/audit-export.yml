@@ -14,6 +14,14 @@ jobs:
   export:
     name: export prior day's audit_log to S3
     runs-on: ubuntu-latest
+    # The `secrets` context is only valid in a step's `with:`/`env:` (and
+    # container/service `credentials:`) - GitHub Actions rejects it in any
+    # `if:` condition at parse time (that's what "Unrecognized named-value:
+    # 'secrets'" means), so the presence check below goes through this
+    # job-level `env:` instead and the two steps' `if:` branch on
+    # `env.AUDIT_LOG_S3_BUCKET`, which *is* allowed in `if:`.
+    env:
+      AUDIT_LOG_S3_BUCKET: ${{ secrets.AUDIT_LOG_S3_BUCKET }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
@@ -21,16 +29,16 @@ jobs:
       # complementary "Not configured" step below covers the opposite case,
       # so exactly one of the two always runs.
       - name: Export to S3
-        if: ${{ secrets.AUDIT_LOG_S3_BUCKET != '' }}
+        if: ${{ env.AUDIT_LOG_S3_BUCKET != '' }}
         run: |
           uv sync --no-dev
           uv run python scripts/export_audit_to_s3.py
         env:
-          S3_BUCKET: ${{ secrets.AUDIT_LOG_S3_BUCKET }}
+          S3_BUCKET: ${{ env.AUDIT_LOG_S3_BUCKET }}
           DATABASE_URL: ${{ secrets.AUDIT_LOG_DATABASE_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AUDIT_LOG_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AUDIT_LOG_AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AUDIT_LOG_AWS_REGION }}
       - name: Not configured
-        if: ${{ secrets.AUDIT_LOG_S3_BUCKET == '' }}
+        if: ${{ env.AUDIT_LOG_S3_BUCKET == '' }}
         run: echo "AUDIT_LOG_S3_BUCKET secret not set - skipping export (see this workflow's header comment)"

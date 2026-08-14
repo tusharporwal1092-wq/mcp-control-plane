@@ -7,12 +7,19 @@ services:
       - REDIS_URL=redis://redis:6379
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/mcp_control_plane
       - OPA_URL=http://opa:8181/v1/data/authz
+      # Set (only here, not in local `uv run` dev) so the gateway actually
+      # pushes OTLP - see app/otel.py's module docstring for why an unset
+      # endpoint is treated as "telemetry off" rather than "retry forever".
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_SERVICE_NAME=mcp-gateway
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
       opa:
+        condition: service_started
+      otel-collector:
         condition: service_started
 
   opa:
@@ -49,6 +56,56 @@ services:
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+  # --- Observability stack (docs/roadmap.md Phase 6) --------------------
+  # gateway --OTLP--> otel-collector --traces--> tempo
+  #                                  \--metrics--> its own :8889 (scraped by prometheus)
+  # grafana reads both tempo and prometheus (see observability/grafana/provisioning).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml
+    ports:
+      - "3200:3200"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      # No login flow for local dev - a real deploy sits behind the ALB/SSO
+      # this repo doesn't build (see docs/architecture.md), not behind
+      # Grafana's own auth.
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
 
 volumes:
   postgres_data:

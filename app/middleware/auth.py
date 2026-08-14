@@ -14,6 +14,8 @@ from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from ..otel import tracer
+
 DEFAULT_RATE_LIMIT_RPM = 60
 
 # Paths that don't require an API key (liveness/readiness probes).
@@ -72,13 +74,18 @@ async def authenticate(request: Request, call_next):
     if request.url.path in PUBLIC_PATHS or request.url.path.startswith(PUBLIC_PATH_PREFIXES):
         return await call_next(request)
 
-    api_key = request.headers.get("x-api-key")
-    agent = API_KEYS.get(api_key)
-    if agent is None:
-        return JSONResponse(
-            _rpc_error(None, -32001, "Missing or invalid API key"),
-            status_code=status.HTTP_401_UNAUTHORIZED,
-        )
+    with tracer.start_as_current_span("authn") as span:
+        api_key = request.headers.get("x-api-key")
+        agent = API_KEYS.get(api_key)
+        if agent is None:
+            span.set_attribute("authn.result", "denied")
+            return JSONResponse(
+                _rpc_error(None, -32001, "Missing or invalid API key"),
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
 
-    request.state.agent = agent
+        span.set_attribute("authn.result", "ok")
+        span.set_attribute("agent_id", str(agent.id))
+        request.state.agent = agent
+
     return await call_next(request)

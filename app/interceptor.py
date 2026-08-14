@@ -43,13 +43,19 @@ class ToolCallContext:
     role: str
     requested_at: float = field(default_factory=time.time)
 
+    @property
+    def environment(self) -> str:
+        """Same inference `to_opa_input` uses, exposed for callers (OTel span
+        attributes in app/main.py) that need it outside the OPA input shape."""
+        return _infer_environment(self.arguments)
+
     def to_opa_input(self) -> dict:
         """Shape expected by the OPA policy input document (policies/authz.rego)."""
         return {
             "agent": {"id": self.agent_id, "role": self.role},
             "tool": {"name": self.tool_name, "args": self.arguments},
             "resource": {"namespace": self.arguments.get("namespace")},
-            "environment": _infer_environment(self.arguments),
+            "environment": self.environment,
         }
 
 

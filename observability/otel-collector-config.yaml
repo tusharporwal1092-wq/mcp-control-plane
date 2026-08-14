@@ -1,0 +1,41 @@
+# OTel collector, local dev (docker-compose.yaml `otel-collector` service).
+# One hop between the gateway and the two backends: traces -> Tempo over
+# OTLP/gRPC, metrics -> a Prometheus exporter that `prometheus` (see
+# observability/prometheus.yml) scrapes on a pull basis. Same shape an EKS
+# DaemonSet collector would use in prod, just pointed at in-cluster
+# Tempo/Prometheus instead of these compose services.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Keeps `service.name` (and any other OTel Resource attrs) as
+    # Prometheus labels instead of dropping them - the Grafana dashboards
+    # don't currently filter on it, but losing it silently would be a trap
+    # for whoever adds a second service to this collector later.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
