@@ -15,7 +15,7 @@ still planned, phase by phase — check it before assuming a described feature e
 ## Commands
 
 ```bash
-uv sync                                                          # install deps
+uv sync --extra export                                           # install deps (the `export` extra pulls in boto3 - tests/test_export_script.py imports scripts/export_audit_to_s3.py unconditionally, so a bare `uv sync` leaves the full pytest run unable to even collect)
 uv run alembic upgrade head                                      # apply audit_log/approvals schema (needs Postgres reachable)
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload  # run gateway alone
 docker compose -f docker-compose.yaml up                         # gateway + Redis + Postgres + OPA

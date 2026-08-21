@@ -1,0 +1,14 @@
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mcp-gateway
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "mcp-control-plane.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "mcp-control-plane.selectorLabels" . | nindent 6 }}
+{{- end }}

@@ -1,0 +1,100 @@
+# mcp-gateway Deployment - the gateway container plus an OPA sidecar
+# (docs/architecture.md: "1 per gateway pod", not a shared/separate OPA
+# Deployment - each gateway pod talks to its own OPA over localhost, same
+# as OPA_URL's default in app/authz/opa.py, no cluster-internal network hop
+# or shared-fate blast radius across pods).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gateway
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "mcp-control-plane.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mcp-control-plane.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mcp-control-plane.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          env:
+            - name: OPA_URL
+              value: "http://localhost:{{ .Values.opa.port }}/v1/data/authz"
+            - name: JENKINS_URL
+              value: {{ .Values.env.jenkinsUrl | quote }}
+            - name: PROMETHEUS_URL
+              value: {{ .Values.env.prometheusUrl | quote }}
+            {{- if .Values.otelCollector.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://mcp-otel-collector.{{ .Values.namespace }}.svc.cluster.local:4318"
+            - name: OTEL_SERVICE_NAME
+              value: "mcp-gateway"
+            {{- end }}
+          {{- if .Values.externalSecrets.enabled }}
+          envFrom:
+            - secretRef:
+                name: mcp-gateway-secrets
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+        - name: opa
+          image: {{ .Values.opa.image }}
+          args:
+            - "run"
+            - "--server"
+            - "--addr=0.0.0.0:{{ .Values.opa.port }}"
+            {{- if .Values.opa.policyConfigMapName }}
+            - "/policies"
+            {{- end }}
+          ports:
+            - name: opa
+              containerPort: {{ .Values.opa.port }}
+          {{- if .Values.opa.policyConfigMapName }}
+          volumeMounts:
+            - name: opa-policies
+              mountPath: /policies
+              readOnly: true
+          {{- end }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+      {{- if .Values.opa.policyConfigMapName }}
+      volumes:
+        - name: opa-policies
+          configMap:
+            name: {{ .Values.opa.policyConfigMapName }}
+      {{- end }}

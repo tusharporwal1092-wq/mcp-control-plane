@@ -1,0 +1,19 @@
+mcp-control-plane deployed to namespace {{ .Values.namespace }}.
+
+Check rollout status:
+  kubectl -n {{ .Values.namespace }} rollout status deployment/mcp-gateway
+
+{{- if .Values.externalSecrets.enabled }}
+Secrets are synced by the External Secrets Operator - if mcp-gateway-secrets
+never appears, check the ExternalSecret's status first:
+  kubectl -n {{ .Values.namespace }} describe externalsecret mcp-gateway-secrets
+{{- end }}
+
+{{- if not .Values.opa.policyConfigMapName }}
+opa.policyConfigMapName is unset: the OPA sidecar is running with no policy
+bundle mounted, so every policy check denies by default (app/authz/opa.py
+fails closed on anything that isn't a well-formed allow). Create a
+ConfigMap from policies/ and set opa.policyConfigMapName to it:
+  kubectl -n {{ .Values.namespace }} create configmap opa-policies --from-file=policies/
+  helm upgrade {{ .Release.Name }} . --reuse-values --set opa.policyConfigMapName=opa-policies
+{{- end }}

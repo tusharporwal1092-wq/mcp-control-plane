@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mcp-control-plane
+description: MCP Control Plane gateway - Deployment, Service, HPA, PodDisruptionBudget, OPA sidecar, OTel collector (docs/roadmap.md Phase 7)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

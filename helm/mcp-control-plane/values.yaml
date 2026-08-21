@@ -1,0 +1,112 @@
+# Defaults for a standalone `helm install` (e.g. against a local kind/minikube
+# cluster - see README's "Local Kubernetes tools" note). terraform/helm.tf
+# overrides the environment-specific subset of these (image tag, replica
+# count, IRSA role/secret ARNs, ...) per workspace when it drives this chart
+# as part of `terraform apply` - see that file for exactly which values it sets.
+
+namespace: mcp-control-plane
+environment: staging # "staging" | "prod" - overridden by terraform/helm.tf to match terraform.workspace; only used to build the Secrets Manager key prefix below
+awsRegion: us-east-1 # overridden by terraform/helm.tf to match var.region
+
+image:
+  repository: mcp-control-plane/gateway # overridden to the real ECR repo URL by terraform/helm.tf
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+service:
+  # Fixed (not auto-allocated): terraform/alb.tf's target group forwards to
+  # this exact NodePort - see terraform/variables.tf's gateway_node_port
+  # for why this can't just be "whatever Kubernetes picks."
+  type: NodePort
+  port: 8000
+  nodePort: 30080
+
+serviceAccount:
+  # terraform/k8s-rbac.tf already creates this ServiceAccount with the
+  # mcp-gateway-role IRSA annotation - the chart intentionally doesn't
+  # create its own (a second annotation-less SA of the same name would just
+  # conflict), only references it by name.
+  create: false
+  name: mcp-gateway
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+
+pdb:
+  enabled: true
+  minAvailable: 1 # tolerates one pod down (node drain, rolling update) without going fully unavailable
+
+# app/tools/tools_spec.py env vars - non-secret config only; DB/Redis/
+# Jenkins-token/Slack-signing-secret come from externalSecrets below, never
+# hardcoded here.
+env:
+  jenkinsUrl: ""
+  prometheusUrl: ""
+
+# opa-sidecar: docs/architecture.md's deployment diagram - "1 per gateway
+# pod", not a separate Deployment. Policies loaded from a ConfigMap today,
+# not the S3 bundle-polling docs/architecture.md eventually calls for - see
+# templates/opa-policies-configmap.yaml's header comment for why and the
+# upgrade path.
+opa:
+  image: openpolicyagent/opa:latest
+  port: 8181
+  policyConfigMapName: "" # set to an operator-managed ConfigMap name (kubectl create configmap ... --from-file=policies/) to actually serve real policies; empty runs OPA with no bundle mounted (deny-by-default, since app/authz/opa.py fails closed on any non-200/malformed response anyway)
+
+# otel-collector: docs/architecture.md's deployment diagram - "Deployment:
+# otel-collector (1 replica)", separate from the gateway pods (unlike OPA).
+# Same collector config shape as observability/otel-collector-config.yaml
+# (Phase 6's local docker-compose stack); exportEndpoint left blank by
+# default so a fresh cluster's collector doesn't crash-loop with nowhere to
+# send data - it falls back to a `logging` exporter (visible via
+# `kubectl logs`) until a real Tempo/Prometheus/Grafana Cloud endpoint is
+# configured, matching app/otel.py's own "unset endpoint = don't attempt
+# network export" stance from Phase 6.
+otelCollector:
+  enabled: true
+  image: otel/opentelemetry-collector-contrib:0.111.0
+  exportEndpoint: "" # OTLP/gRPC endpoint for a real backend (Tempo + a Prometheus remote-write target, or a vendor); empty = logging exporter only
+
+# Syncs secrets.tf's Secrets Manager secrets (Redis URL, Jenkins token,
+# Slack signing secret) plus RDS's own auto-managed DB credential
+# (dbSecretArn - not something Terraform created, see rds.tf's comment)
+# into a single K8s Secret (mcp-gateway-secrets) via the External Secrets
+# Operator - requires ESO's CRDs/controller already installed in the
+# cluster (terraform/helm.tf installs it as a `helm_release` alongside this
+# chart, so a plain `terraform apply` still gets a working cluster; a
+# standalone `helm install` of just this chart needs ESO installed
+# separately first, or set `externalSecrets.enabled: false` and provide
+# DATABASE_URL/REDIS_URL/etc. some other way - e.g. `--set-string
+# env.<var>=...` won't work since those are secret-shaped, but a manually
+# `kubectl apply`'d Secret named mcp-gateway-secrets with the same key
+# names works fine).
+externalSecrets:
+  enabled: true
+
+# Only used to assemble DATABASE_URL inside the ExternalSecret template
+# (templates/external-secret.yaml) - none of these three are secret values
+# themselves (see helm.tf's comment on why they're safe as plain values).
+# Defaults below are empty/local-only; terraform/helm.tf always overrides
+# them with the real RDS instance's address/port/db_name and its
+# AWS-managed credential secret ARN.
+dbSecretArn: ""
+rds:
+  host: "localhost"
+  port: 5432
+  dbName: "mcp_control_plane"
+
+podAnnotations: {}
+podLabels: {}

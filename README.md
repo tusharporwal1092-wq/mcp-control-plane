@@ -39,12 +39,19 @@ implemented:
   `approval_requests_total`/`rate_limit_hits_total`/`tool_call_duration_ms` and friends), an OTel
   collector + Tempo + Prometheus + Grafana stack in `docker-compose.yaml`, 6 provisioned Grafana
   dashboards and 4 alert rules under `observability/` — see `docs/roadmap.md` Phase 6.
+- Terraform for the full AWS deployment target (VPC, EKS + managed node group, ECR, RDS, ElastiCache
+  Redis, ALB/ACM, IRSA IAM roles, Secrets Manager, an Object-Locked S3 bucket for the audit export)
+  plus a Helm chart (`helm/mcp-control-plane/`) installed by Terraform itself, under `terraform/` —
+  see `docs/roadmap.md` Phase 7, **including its "what's actually been checked" note**: this was
+  written with no AWS account available, so it's `fmt`/reference/`init`-clean and the Helm chart
+  is `lint`/`template`-verified, but has never been `plan`/`apply`/`destroy`-run against real AWS.
 
 Not yet built: admin JWT auth in front of `/admin/approvals/*` and `/admin/audit*` (both currently
 have no auth of their own beyond the approval-decide endpoint's Slack HMAC check), automated
 retention enforcement (the 90-day Postgres deletion and S3-to-Glacier lifecycle rule are
-documented but not scheduled anywhere), and the EKS DaemonSet variant of the OTel collector (no
-cluster exists yet - Phase 7) — see the roadmap for sequencing.
+documented but not scheduled anywhere), and the EKS DaemonSet variant of the OTel collector (Phase
+6 only ships the Docker Compose one; `terraform/helm.tf` runs the collector as a regular in-cluster
+Deployment, not a DaemonSet) — see the roadmap for sequencing.
 
 ## Architecture
 
@@ -88,8 +95,11 @@ dependency versions.
 ### Install
 
 ```bash
-uv sync
+uv sync --extra export
 ```
+
+(`--extra export` pulls in `boto3` — `tests/test_export_script.py` imports `scripts/export_audit_to_s3.py`
+unconditionally, so a bare `uv sync` leaves the full `uv run pytest` run unable to even collect.)
 
 ### Run
 
@@ -113,6 +123,42 @@ The 6 dashboards and 4 alert rules under `observability/grafana/` are provisione
 The PagerDuty/Slack contact points (`observability/grafana/provisioning/alerting/contact-points.yaml`)
 ship with placeholder values and will provision cleanly either way - replace them with a real
 integration key/webhook URL before an alert needs to actually page anyone.
+
+**Dashboards start empty** - they only show data once something sends real traffic through the
+gateway *container* (the one `docker compose` starts; only it has `OTEL_EXPORTER_OTLP_ENDPOINT`
+set - `uv run pytest` and a locally-run `uvicorn` deliberately don't export telemetry, see
+`app/otel.py`). With the stack up and migrated, fire a few requests at it (each maps to a
+different dashboard/panel) and wait ~60-90s for the metrics export + Prometheus scrape interval:
+
+```bash
+# Tool Call Volume + Latency - any tool call, success or failure, records these
+curl -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" \
+  -d '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"get_pod_logs","arguments":{"namespace":"payments","pod_name":"checkout-api-xyz"}}}'
+
+# Denial Rate - has to actually reach OPA and be denied there; a tool the agent isn't
+# scoped to at all (app/middleware/auth.py's allowed_tools) gets rejected before OPA/audit
+# ever see it and won't show up here - this hits OPA's kube-system hard-block instead
+curl -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" \
+  -d '{"jsonrpc":"2.0","id":"2","method":"tools/call","params":{"name":"restart_deployment","arguments":{"namespace":"kube-system","deployment_name":"coredns","reason":"testing denial rate"}}}'
+
+# Approval Queue - require_approval (any write tool in a prod-* namespace)
+curl -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" \
+  -d '{"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"restart_deployment","arguments":{"namespace":"prod-payments","deployment_name":"checkout-api","reason":"testing approval queue"}}}'
+
+# Rate Limit - test_key's default limit is 60/min (DEFAULT_RATE_LIMIT_RPM), so fire more than that quickly
+for i in $(seq 1 70); do
+  curl -s -o /dev/null -X POST http://127.0.0.1:8000/mcp -H "Content-Type: application/json" -H "x-api-key: test_key" \
+    -d '{"jsonrpc":"2.0","id":"'$i'","method":"tools/list","params":{}}'
+done
+```
+
+Audit Chain Integrity is the one dashboard these won't touch - it only reports data when
+`GET /admin/audit` actually finds a broken hash chain, so staying at zero is the correct/healthy
+state, not something to artificially populate. On Windows, run the block above from PowerShell or
+Git Bash, not `cmd.exe` - `cmd.exe` doesn't treat `'...'` as a string delimiter the way these
+commands assume, so the JSON body arrives with literal quote characters in it and the gateway
+correctly rejects it with `-32700 Parse error` (same failure mode `testing/testing.text` 3.8
+tests on purpose, just not on purpose here).
 
 Or the gateway alone against local dependencies (Redis, Postgres, OPA each running separately).
 Apply the audit-log schema once before the first run:
@@ -213,6 +259,15 @@ Rego policy tests run separately, via `opa test`:
 
 ```bash
 docker run --rm -v "$(pwd)/policies:/policies" openpolicyagent/opa:latest test /policies -v
+```
+
+On Windows, run that from PowerShell, not Git Bash — Git Bash's MSYS layer auto-translates the
+leading `/policies` in `-v "$(pwd)/policies:/policies"` into a bogus Windows path (`stat
+/Program Files/Git/policies: no such file or directory`), which has nothing to do with the
+policies themselves:
+
+```powershell
+docker run --rm -v "${PWD}\policies:/policies" openpolicyagent/opa:latest test /policies -v
 ```
 
 `opa test` runs in CI on every PR (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml));

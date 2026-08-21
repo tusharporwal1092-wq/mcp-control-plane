@@ -8,3 +8,16 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Terraform (terraform/, terraform/bootstrap/) - local plugin cache and any
+# state that isn't the remote S3 backend (there shouldn't be any, but a
+# `-backend=false` init or a workspace mistake during development can leave
+# one behind). Deliberately NOT ignoring .terraform.lock.hcl - Terraform's
+# own guidance is to commit it, so every `terraform init` resolves the same
+# provider versions.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
